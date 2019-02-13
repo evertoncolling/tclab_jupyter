@@ -11,7 +11,7 @@ The TCLab system is built with two temperature sensors and two heaters. A Matlab
 
 This demonstration app implements four different control techniques (Manual, On-Off, PID and MPC) so the user can test and visualize the differences between them.
 
-There is a also a configurations window that presents some parameters that can be adjusted for the whole simulation or for each control technique.
+There is also a configurations window that presents some parameters that can be adjusted for the whole simulation or for each control technique.
 
 **Dependencies**
 - ipywidgets
