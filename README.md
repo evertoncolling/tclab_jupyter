@@ -26,7 +26,7 @@ Currently this code will not work on Mac OS due to limitations on the gekko libr
 
 Just download the control_demo.py to your system and create a Jupyter Notebook file (.ipynb) on the same folder.
 
-Then import the module and create and object as shown below.
+Then import the module and create an object as shown below.
 ```python
 import control_demo as cd
 demo = cd.GUI()
