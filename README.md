@@ -12,13 +12,17 @@ demo = cd.GUI()
 demo.app()
 ```
 
-![App Screenshot](https://github.com/evertoncolling/tclab_jupyter/blob/master/APP.PNG "App Screenshot")
+<p align="center">
+  <img src="https://github.com/evertoncolling/tclab_jupyter/blob/master/APP.PNG" alt="App Screenshot">
+</p>
 
 ```python
 demo.config()
 ```
 
-![Config Screenshot](https://github.com/evertoncolling/tclab_jupyter/blob/master/CONFIG.PNG "Config Screenshot")
+<p align="center">
+  <img src="https://github.com/evertoncolling/tclab_jupyter/blob/master/CONFIG.PNG" alt="Config Screenshot">
+</p>
 
 **Dependencies:**
 ```python
