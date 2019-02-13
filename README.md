@@ -13,20 +13,23 @@ This demonstration app implements four different control techniques (Manual, On-
 
 There is also a configurations window that presents some parameters that can be adjusted for the whole simulation or for each control technique.
 
+The interface was build using ipywidgets and bqplot. The dynamic plant simulation is done using scipy `odeint` function, whilst the MPC is implemented using the gekko library. For more information regarding the MPC options refer to the gekko documentation (https://gekko.readthedocs.io/en/latest/).
+
 **Dependencies**
-- ipywidgets
 - numpy
 - scipy
-- gekko
-- bqplot
+- ipywidgets (https://github.com/jupyter-widgets/ipywidgets)
+- bqplot (https://github.com/bloomberg/bqplot)
+- gekko (https://github.com/BYU-PRISM/GEKKO)
 
-Currently this code will not work on Mac OS due to limitations on the gekko library. This limitation can be overcomed by running Python from a docker container.
+
+Currently this code will not work on Mac OS due to limitations on the gekko library. This limitation can be overcomed by running Python from a docker container (or using a regular linux VM).
 
 **Usage**
 
 Just download the control_demo.py to your system and create a Jupyter Notebook file (.ipynb) on the same folder.
 
-Then import the module and create an object as shown below.
+Import the module and create an object as shown below.
 ```python
 import control_demo as cd
 demo = cd.GUI()
@@ -49,7 +52,3 @@ demo.config()
 <p align="center">
   <img src="https://github.com/evertoncolling/tclab_jupyter/blob/master/CONFIG.PNG" alt="Config Screenshot">
 </p>
-
-**MPC Options**
-
-The MPC was implemented using the gekko library, for more information refer to the documentation (https://gekko.readthedocs.io/en/latest/).
