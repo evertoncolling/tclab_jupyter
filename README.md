@@ -7,7 +7,7 @@ A jupyter based application to explore different control techniques of a simple 
 
 This code was written to showcase an Arduino based Temperature Control Lab (https://apmonitor.com/pdc/index.php/Main/ArduinoTemperatureControl) for a Lecture on Advanced Control Techniques.
 
-The TCLab system is built with two temperature sensors and two heaters. A Matlab or Python interface is provided to read the temperature data from the board and control the heaters power output. This implementation was modified, replacing the interface with Arduino with a simulator, so the app can be used without the real hardware.
+The TCLab system is built with two temperature sensors and two heaters. A Matlab or Python interface is provided to read the temperature data from the board and control the heaters power output. This implementation was modified, replacing the Arduino interface with a simulator, so the app can be used without the real hardware.
 
 This demonstration app implements four different control techniques (Manual, On-Off, PID and MPC) so the user can test and visualize the differences between them.
 
