@@ -58,10 +58,10 @@ class GUI(object):
 
         # Create Lines/Markers
         self._T1_meas = bq.Scatter(x=[], y=[], scales=T_sc_set,
-                                   marker='triangle-up', colors=[colors[0]],
+                                   marker='circle', colors=[colors[0]],
                                    display_legend=False, default_size=20)
         self._T2_meas = bq.Scatter(x=[], y=[], scales=T_sc_set,
-                                   marker='triangle-down', colors=[colors[2]],
+                                   marker='circle', colors=[colors[2]],
                                    display_legend=False, default_size=20)
 
         self._T1_set_point = bq.Lines(x=[], y=[], scales=T_sc_set,
@@ -1344,6 +1344,25 @@ class GUI(object):
             m.Q2.DMAX = self._Q2_DMAX
             m.Q2.DCOST = self._Q2_DCOST
 
+            # Update prediction horizon
+            DT = self._delta_t
+            m.time = [
+                0,
+                DT,
+                DT*2,
+                DT*3,
+                DT*4,
+                DT*5,
+                DT*6,
+                DT*7,
+                DT*8,
+                DT*10,
+                DT*12,
+                DT*15,
+                DT*18,
+                DT*20,
+                DT*25]
+
             if m.options.CV_TYPE == 1:
                 # Input setpoint with deadband +/- DT
                 DT1 = self._T1_dt
@@ -1357,13 +1376,17 @@ class GUI(object):
                 m.TC1.SP = self._T1_SP
                 m.TC2.SP = self._T2_SP
 
-            # Solve MPC
-            m.solve(disp=False)
-            # Check if successful solution
-            if (m.options.APPSTATUS == 1):
-                # retrieve new value
-                Q10 = m.Q1.NEWVAL
-                Q20 = m.Q2.NEWVAL
+            try:
+                # Solve MPC
+                m.solve(disp=False)
+                # Check if successful solution
+                if (m.options.APPSTATUS == 1):
+                    # retrieve new value
+                    Q10 = m.Q1.NEWVAL
+                    Q20 = m.Q2.NEWVAL
+            except:
+                # Keep previous value
+                pass
 
             ts = [t[-1], t[-1]+self._delta_t]
             y = odeint(self._heater, Th0, ts, args=(Q10, Q20))
