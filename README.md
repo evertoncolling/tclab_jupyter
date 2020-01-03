@@ -23,9 +23,6 @@ The interface was build using ipywidgets and bqplot. The dynamic plant simulatio
 - gekko (https://github.com/BYU-PRISM/GEKKO)
 - tclab (only for the control_arduino.py)
 
-
-Currently this code will not work on Mac OS due to limitations on the gekko library. This limitation can be overcomed by running Python from a docker container (or using a regular linux VM).
-
 **Usage**
 
 Just download the control_demo.py to your system and create a Jupyter Notebook file (.ipynb) on the same folder.
