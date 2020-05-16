@@ -19,7 +19,7 @@ The interface was build using ipywidgets and bqplot. The dynamic plant simulatio
 - numpy
 - scipy
 - ipywidgets (https://github.com/jupyter-widgets/ipywidgets)
-- bqplot (https://github.com/bloomberg/bqplot)
+- bqplot==0.11.9 (https://github.com/bloomberg/bqplot)
 - gekko (https://github.com/BYU-PRISM/GEKKO)
 - tclab (only for the control_arduino.py)
 
