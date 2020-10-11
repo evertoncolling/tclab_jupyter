@@ -1,0 +1,4 @@
+.venv*
+.ipynb*
+__pycache__
+poetry.lock
