@@ -1,4 +1,5 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/evertoncolling/tclab_jupyter/master)
 
 # tclab_jupyter
 A jupyter based application to explore different control techniques of a simple temperature plant
