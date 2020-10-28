@@ -26,12 +26,12 @@ The interface was build using ipywidgets and bqplot. The dynamic plant simulatio
 
 **Usage**
 
-Just download the control_demo.py to your system and create a Jupyter Notebook file (.ipynb) on the same folder.
+Just download the `control_demo.py` (or `control_arduino.py` if you are using it with the TCLab) to your system and create a Jupyter Notebook file (.ipynb) on the same folder.
 
 Import the module and create an object as shown below.
 ```python
-import control_demo as cd
-demo = cd.GUI()
+import control_demo as cn # change to import control_arduino to use with TCLab
+demo = cn.GUI()
 ```
 
 To open the main window, call the app function.
