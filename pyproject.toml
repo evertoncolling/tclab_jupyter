@@ -8,7 +8,7 @@ license = "MIT"
 [tool.poetry.dependencies]
 python = "^3.8"
 bqplot = "0.11.9"
-numpy = "1.19.2"
+numpy = "1.22.0"
 gekko = "0.2.8"
 scipy = "1.5.2"
 ipywidgets = "7.5.1"
