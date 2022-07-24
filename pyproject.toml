@@ -6,11 +6,11 @@ authors = ["Everton Colling <evertoncolling@gmail.com>"]
 license = "MIT"
 
 [tool.poetry.dependencies]
-python = "^3.8"
+python = ">=3.8,<3.11"
 bqplot = "0.11.9"
-numpy = "1.19.2"
-gekko = "0.2.8"
-scipy = "1.5.2"
+numpy = "1.22.0"
+gekko = "1.0.4"
+scipy = "1.8.1"
 ipywidgets = "7.5.1"
 jupyter = "1.0.0"
 tclab = "0.4.9"
