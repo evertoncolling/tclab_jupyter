@@ -2,56 +2,113 @@
 
 # tclab_jupyter
 
-A jupyter based application and library to explore different control techniques of a simple temperature plant.
+A Jupyter-based application and library to explore different control techniques for a simple temperature plant.
 
 ## Overview
 
-This code was written to showcase an Arduino based Temperature Control Lab (https://apmonitor.com/pdc/index.php/Main/ArduinoTemperatureControl) for a Lecture on Advanced Control Techniques.
+This project was written to showcase the Arduino-based Temperature Control Lab for lectures on advanced control techniques:
+[Arduino Temperature Control Lab](https://apmonitor.com/pdc/index.php/Main/ArduinoTemperatureControl)
 
-The TCLab system is built with two temperature sensors and two heaters. A Matlab or Python interface is provided to read the temperature data from the board and control the heaters power output. A library was created with two entry points, one that aims to control the Arduino System (`HardwareNotebookApp`) and another one replacing the Arduino interface with a simulator (`SimulationNotebookApp`), so the app can be used without the real hardware, as a demonstration.
+The TCLab system has two temperature sensors and two heaters. This package provides two notebook entrypoints:
 
-This project implements four different control techniques (Manual, On-Off, PID and MPC) so the user can test and visualize the differences between them.
+- `SimulationNotebookApp` for a simulated plant, so the app can be used without hardware
+- `HardwareNotebookApp` for a real TCLab device
 
-There is also a configurations window that presents some parameters that can be adjusted for the whole simulation or for each control technique.
+The project implements four control techniques:
 
-The interface was build using ipywidgets and bqplot. The dynamic plant simulation is done using scipy `odeint` function, whilst the MPC is implemented using the gekko library. For more information regarding the MPC options refer to the gekko documentation (https://gekko.readthedocs.io/en/latest/).
+- Manual
+- On-Off
+- PID
+- MPC
 
-**Dependencies**
-- numpy
-- scipy
-- ipywidgets (https://github.com/jupyter-widgets/ipywidgets)
-- bqplot==0.11.9 (https://github.com/bloomberg/bqplot)
-- gekko (https://github.com/BYU-PRISM/GEKKO)
-- tclab (only for the control_arduino.py)
+It also includes a configuration window where simulation and controller parameters can be adjusted while the app is running.
+
+The interface is built with `ipywidgets` and `bqplot`. The simulated plant uses SciPy, and MPC is implemented with GEKKO. For more information on MPC options, see the [GEKKO documentation](https://gekko.readthedocs.io/en/latest/).
+
+## Requirements
+
+- Python `>=3.11`
+
+## Dependencies
+
+Core package dependencies:
+
+- `numpy`
+- `scipy`
+- `gekko`
+
+Optional extras:
+
+- `notebook`: `ipywidgets`, `bqplot`, `jupyter`
+- `hardware`: `tclab`
 
 ## Install
 
+For notebook use with the simulated plant:
+
 ```bash
-pip install tclab_jupyter
+pip install "tclab-jupyter[notebook]"
+```
+
+For notebook use with real hardware:
+
+```bash
+pip install "tclab-jupyter[notebook,hardware]"
 ```
 
 ## Usage
 
-Import the module and create an object as shown below.
+Simulation mode:
+
 ```python
 from tclab_jupyter.ui.notebook import SimulationNotebookApp
+
 demo = SimulationNotebookApp()
+demo.app()
+demo.config()
 ```
 
-To open the main window, call the app function.
+Hardware mode:
+
 ```python
+from tclab_jupyter.ui.notebook import HardwareNotebookApp
+
+demo = HardwareNotebookApp()
 demo.app()
+demo.config()
 ```
+
+Main app window:
 
 <p align="center">
   <img src="https://github.com/evertoncolling/tclab_jupyter/blob/master/img/APP.PNG?raw=true" alt="App Screenshot">
 </p>
 
-To open the configurations window, call the config function.
-```python
-demo.config()
-```
+Configuration window:
 
 <p align="center">
   <img src="https://github.com/evertoncolling/tclab_jupyter/blob/master/img/CONFIG.PNG?raw=true" alt="Config Screenshot">
 </p>
+
+## Development
+
+Set up the local environment with `uv`:
+
+```bash
+uv sync --group dev --extra notebook
+```
+
+If you are working with hardware too:
+
+```bash
+uv sync --group dev --extra notebook --extra hardware
+```
+
+Useful checks:
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run ty check src/tclab_jupyter/runtime.py tests
+uv run pytest -q
+```
