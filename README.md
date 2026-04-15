@@ -44,7 +44,7 @@ demo.app()
 ```
 
 <p align="center">
-  <img src="https://github.com/evertoncolling/tclab_jupyter/blob/master/img/APP.PNG" alt="App Screenshot">
+  <img src="https://github.com/evertoncolling/tclab_jupyter/blob/master/img/APP.PNG?raw=true" alt="App Screenshot">
 </p>
 
 To open the configurations window, call the config function.
@@ -53,5 +53,5 @@ demo.config()
 ```
 
 <p align="center">
-  <img src="https://github.com/evertoncolling/tclab_jupyter/blob/master/img/CONFIG.PNG" alt="Config Screenshot">
+  <img src="https://github.com/evertoncolling/tclab_jupyter/blob/master/img/CONFIG.PNG?raw=true" alt="Config Screenshot">
 </p>
