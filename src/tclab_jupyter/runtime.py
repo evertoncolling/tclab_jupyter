@@ -108,6 +108,8 @@ class ControlRuntime:
     def initialize(
         self, q1: float, q2: float, sp1_c: float, sp2_c: float
     ) -> RuntimeSnapshot:
+        self._elapsed_s = 0.0
+        self.history = _History(self.config.max_points)
         snapshot = self.backend.initialize()
         t1_c, t2_c = snapshot.sensor_temperatures_k - 273.15
         self.history.append(
@@ -128,7 +130,7 @@ class ControlRuntime:
         self, q1: float, q2: float, sp1_c: float, sp2_c: float
     ) -> RuntimeSnapshot:
         backend_snapshot = self.backend.step(q1=q1, q2=q2, delta_t=self.config.delta_t)
-        self._elapsed_s += self.config.delta_t
+        self._elapsed_s += backend_snapshot.elapsed_s
         t1_c, t2_c = backend_snapshot.sensor_temperatures_k - 273.15
         self.history.append(
             time_s=self._elapsed_s,

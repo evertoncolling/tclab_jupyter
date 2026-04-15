@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, cast
@@ -29,6 +30,7 @@ class SimulationParameters:
 @dataclass(slots=True)
 class BackendSnapshot:
     sensor_temperatures_k: np.ndarray
+    elapsed_s: float
     heater_temperatures_k: np.ndarray | None = None
 
 
@@ -60,6 +62,7 @@ class SimulationBackend:
     def initialize(self) -> BackendSnapshot:
         return BackendSnapshot(
             sensor_temperatures_k=self.sensor_temperatures_k.copy(),
+            elapsed_s=0.0,
             heater_temperatures_k=self.heater_temperatures_k.copy(),
         )
 
@@ -117,6 +120,7 @@ class SimulationBackend:
         )
         return BackendSnapshot(
             sensor_temperatures_k=self.sensor_temperatures_k + noise,
+            elapsed_s=delta_t,
             heater_temperatures_k=self.heater_temperatures_k.copy(),
         )
 
@@ -130,6 +134,7 @@ class HardwareBackend:
     def __init__(
         self,
         lab_factory: Callable[[], TCLabLike] | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         if lab_factory is None:
             try:
@@ -140,11 +145,18 @@ class HardwareBackend:
                 ) from exc
             lab_factory = cast(Callable[[], TCLabLike], module.TCLab)
         self._lab_factory = lab_factory
+        self._monotonic = monotonic or time.monotonic
         self._lab: TCLabLike | None = None
+        self._last_step_monotonic: float | None = None
 
     def initialize(self) -> BackendSnapshot:
         self._lab = self._lab_factory()
-        return BackendSnapshot(sensor_temperatures_k=self._read_temperatures())
+        now = self._monotonic()
+        self._last_step_monotonic = now
+        return BackendSnapshot(
+            sensor_temperatures_k=self._read_temperatures(),
+            elapsed_s=0.0,
+        )
 
     def _require_lab(self) -> TCLabLike:
         if self._lab is None:
@@ -159,7 +171,14 @@ class HardwareBackend:
         lab = self._require_lab()
         lab.Q1(q1)
         lab.Q2(q2)
-        return BackendSnapshot(sensor_temperatures_k=self._read_temperatures())
+        now = self._monotonic()
+        previous = self._last_step_monotonic
+        elapsed_s = delta_t if previous is None else max(0.0, now - previous)
+        self._last_step_monotonic = now
+        return BackendSnapshot(
+            sensor_temperatures_k=self._read_temperatures(),
+            elapsed_s=elapsed_s,
+        )
 
     def shutdown(self) -> None:
         lab = self._lab
@@ -169,3 +188,4 @@ class HardwareBackend:
         lab.Q2(0)
         lab.close()
         self._lab = None
+        self._last_step_monotonic = None

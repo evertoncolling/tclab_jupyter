@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import queue
 import threading
-import time
 from typing import Any
 
 import numpy as np
@@ -27,8 +27,13 @@ class _BaseNotebookGUI:
         self._backend_factory = backend_factory
         self._runtime: ControlRuntime | None = None
         self._worker: threading.Thread | None = None
-        self._flag = False
+        self._ui_poller = None
+        self._running = False
         self._suspend_control_updates = False
+        self._stop_event = threading.Event()
+        self._ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._last_rendered_snapshot: RuntimeSnapshot | None = None
+        self._worker_error: BaseException | None = None
 
         wi, bq, display = _load_widget_modules()
         self._display = display
@@ -312,14 +317,41 @@ class _BaseNotebookGUI:
             RuntimeConfig(delta_t=self._delta_t, history_seconds=self._history_seconds),
         )
 
-    def _ensure_runtime(self) -> ControlRuntime:
-        if self._runtime is None:
-            self._runtime = self._build_runtime()
-            initial = self._runtime.initialize(self._Q10, self._Q20, self._T1_SP, self._T2_SP)
-            self._render(initial)
-        return self._runtime
+    def _clear_ui_queue(self) -> None:
+        while True:
+            try:
+                self._ui_queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _initialize_runtime(self) -> None:
+        if self._runtime is not None:
+            return
+        self._runtime = self._build_runtime()
+        initial = self._runtime.initialize(self._Q10, self._Q20, self._T1_SP, self._T2_SP)
+        self._render(initial)
+
+    def _enqueue_snapshot(self, snapshot: RuntimeSnapshot) -> None:
+        self._ui_queue.put(("snapshot", snapshot))
+
+    def _enqueue_error(self, exc: BaseException) -> None:
+        self._ui_queue.put(("error", exc))
+
+    def _drain_ui_queue(self) -> None:
+        while True:
+            try:
+                event_type, payload = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            if event_type == "snapshot":
+                self._render(payload)
+            elif event_type == "error":
+                self._worker_error = payload
+                self._stop_event.set()
+                self._running = False
 
     def _render(self, snapshot: RuntimeSnapshot) -> None:
+        self._last_rendered_snapshot = snapshot
         time_min = snapshot.time_s / 60.0
         latest_time = float(time_min[-1]) if len(time_min) else 0.0
         window_min = self._history_seconds / 60.0
@@ -447,15 +479,16 @@ class _BaseNotebookGUI:
             self._T2_SP = change["new"]
 
     def _stop_click(self, _button) -> None:
-        self._flag = False
-        self._mode.disabled = False
-        if self._runtime is not None:
-            self._runtime.shutdown()
+        self._stop_worker()
 
     def _play_click(self, _button) -> None:
-        if self._flag:
+        if self._worker is not None and self._worker.is_alive():
             return
-        self._flag = True
+        self._clear_ui_queue()
+        self._initialize_runtime()
+        self._stop_event.clear()
+        self._worker_error = None
+        self._running = True
         self._mode.disabled = True
         workers = {
             "Manual": self._work_man,
@@ -463,11 +496,44 @@ class _BaseNotebookGUI:
             "PID": self._work_pid,
             "MPC": self._work_mpc,
         }
-        self._worker = threading.Thread(target=workers[self._mode.value], daemon=True)
+        self._worker = threading.Thread(target=self._run_worker, args=(workers[self._mode.value],))
         self._worker.start()
+        self._start_ui_poller()
+
+    def _finalize_worker(self) -> None:
+        self._stop_ui_poller()
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            return
+        self._worker = None
+        self._running = False
+        self._mode.disabled = False
+        if self._runtime is not None:
+            self._runtime.shutdown()
+            self._runtime = None
+
+    def _stop_worker(self) -> None:
+        if self._worker is None and self._runtime is None:
+            return
+        self._stop_event.set()
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout=2.0)
+        if worker is None or not worker.is_alive():
+            self._drain_ui_queue()
+            self._finalize_worker()
+        else:
+            self._start_ui_poller()
 
     def _mode_switch(self, value) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
         self._runtime = None
+        self._stop_event.set()
+        self._running = False
+        self._worker_error = None
+        self._clear_ui_queue()
+        self._stop_ui_poller()
         self._T1_SP = 30.0
         self._T2_SP = 30.0
         self._Q10 = 0.0
@@ -489,16 +555,56 @@ class _BaseNotebookGUI:
         for widget in (self._wT1, self._tT1, self._bT1, self._wT2, self._tT2, self._bT2):
             widget.disabled = manual
 
+    def _start_ui_poller(self) -> None:
+        if self._ui_poller is not None:
+            return
+        periodic_callback = importlib.import_module("tornado.ioloop").PeriodicCallback
+        self._ui_poller = periodic_callback(self._poll_ui, 50)
+        self._ui_poller.start()
+
+    def _stop_ui_poller(self) -> None:
+        if self._ui_poller is None:
+            return
+        self._ui_poller.stop()
+        self._ui_poller = None
+
+    def _poll_ui(self) -> None:
+        self._drain_ui_queue()
+        worker = self._worker
+        if worker is None:
+            self._finalize_worker()
+            return
+        if worker.is_alive():
+            return
+        self._finalize_worker()
+
+    def _run_worker(self, worker) -> None:
+        try:
+            worker()
+        except ControllerSolveError as exc:
+            self._stop_event.set()
+            self._enqueue_error(exc)
+        except Exception as exc:
+            self._stop_event.set()
+            self._enqueue_error(exc)
+        finally:
+            self._running = False
+
     def _work_man(self) -> None:
-        runtime = self._ensure_runtime()
-        while self._flag:
+        runtime = self._runtime
+        if runtime is None:
+            return
+        while not self._stop_event.is_set():
             snapshot = runtime.step_manual(self._Q10, self._Q20)
-            self._render(snapshot)
-            time.sleep(self._sleep)
+            self._enqueue_snapshot(snapshot)
+            if self._stop_event.wait(self._sleep):
+                break
 
     def _work_on_off(self) -> None:
-        runtime = self._ensure_runtime()
-        while self._flag:
+        runtime = self._runtime
+        if runtime is None:
+            return
+        while not self._stop_event.is_set():
             snapshot, self._Q10, self._Q20 = runtime.step_on_off(
                 self._Q10,
                 self._Q20,
@@ -507,12 +613,15 @@ class _BaseNotebookGUI:
                 self._q1_dt_on_off,
                 self._q2_dt_on_off,
             )
-            self._render(snapshot)
-            time.sleep(self._sleep)
+            self._enqueue_snapshot(snapshot)
+            if self._stop_event.wait(self._sleep):
+                break
 
     def _work_pid(self) -> None:
-        runtime = self._ensure_runtime()
-        while self._flag:
+        runtime = self._runtime
+        if runtime is None:
+            return
+        while not self._stop_event.is_set():
             snapshot, self._Q10, self._Q20 = runtime.step_pid(
                 self._Q10,
                 self._Q20,
@@ -525,11 +634,14 @@ class _BaseNotebookGUI:
                 self._pid2_reset,
                 self._pid2_rate,
             )
-            self._render(snapshot)
-            time.sleep(self._sleep)
+            self._enqueue_snapshot(snapshot)
+            if self._stop_event.wait(self._sleep):
+                break
 
     def _work_mpc(self) -> None:
-        runtime = self._ensure_runtime()
+        runtime = self._runtime
+        if runtime is None:
+            return
         config = MpcConfig(
             solver=self._SOLVER,
             cvtype=self._CVTYPE,
@@ -542,21 +654,17 @@ class _BaseNotebookGUI:
             q2_dmax=self._Q2_DMAX,
             q2_dcost=self._Q2_DCOST,
         )
-        while self._flag:
-            try:
-                snapshot, self._Q10, self._Q20 = runtime.step_mpc(
-                    self._Q10,
-                    self._Q20,
-                    self._T1_SP,
-                    self._T2_SP,
-                    config,
-                )
-            except ControllerSolveError as exc:
-                self._flag = False
-                self._mode.disabled = False
-                raise RuntimeError("MPC control loop failed") from exc
-            self._render(snapshot)
-            time.sleep(self._sleep)
+        while not self._stop_event.is_set():
+            snapshot, self._Q10, self._Q20 = runtime.step_mpc(
+                self._Q10,
+                self._Q20,
+                self._T1_SP,
+                self._T2_SP,
+                config,
+            )
+            self._enqueue_snapshot(snapshot)
+            if self._stop_event.wait(self._sleep):
+                break
 
 
 class SimulationNotebookApp(_BaseNotebookGUI):
