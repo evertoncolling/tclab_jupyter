@@ -40,7 +40,7 @@ class RuntimeSnapshot:
 
 @dataclass(slots=True)
 class _History:
-    max_points: int
+    history_seconds: float
     time_s: deque[float] = field(init=False)
     q1: deque[float] = field(init=False)
     q2: deque[float] = field(init=False)
@@ -50,13 +50,13 @@ class _History:
     sp2_c: deque[float] = field(init=False)
 
     def __post_init__(self) -> None:
-        self.time_s = deque(maxlen=self.max_points)
-        self.q1 = deque(maxlen=self.max_points)
-        self.q2 = deque(maxlen=self.max_points)
-        self.t1_c = deque(maxlen=self.max_points)
-        self.t2_c = deque(maxlen=self.max_points)
-        self.sp1_c = deque(maxlen=self.max_points)
-        self.sp2_c = deque(maxlen=self.max_points)
+        self.time_s = deque()
+        self.q1 = deque()
+        self.q2 = deque()
+        self.t1_c = deque()
+        self.t2_c = deque()
+        self.sp1_c = deque()
+        self.sp2_c = deque()
 
     def append(
         self,
@@ -76,6 +76,20 @@ class _History:
         self.t2_c.append(t2_c)
         self.sp1_c.append(sp1_c)
         self.sp2_c.append(sp2_c)
+        self.prune()
+
+    def prune(self) -> None:
+        if not self.time_s:
+            return
+        oldest_time = self.time_s[-1] - self.history_seconds
+        while self.time_s and self.time_s[0] < oldest_time:
+            self.time_s.popleft()
+            self.q1.popleft()
+            self.q2.popleft()
+            self.t1_c.popleft()
+            self.t2_c.popleft()
+            self.sp1_c.popleft()
+            self.sp2_c.popleft()
 
     def snapshot(self) -> RuntimeSnapshot:
         return RuntimeSnapshot(
@@ -99,7 +113,7 @@ class ControlRuntime:
     ) -> None:
         self.backend = backend
         self.config = config or RuntimeConfig()
-        self.history = _History(self.config.max_points)
+        self.history = _History(self.config.history_seconds)
         self._elapsed_s = 0.0
         self._pid1 = PIDState()
         self._pid2 = PIDState()
@@ -109,7 +123,7 @@ class ControlRuntime:
         self, q1: float, q2: float, sp1_c: float, sp2_c: float
     ) -> RuntimeSnapshot:
         self._elapsed_s = 0.0
-        self.history = _History(self.config.max_points)
+        self.history = _History(self.config.history_seconds)
         snapshot = self.backend.initialize()
         t1_c, t2_c = snapshot.sensor_temperatures_k - 273.15
         self.history.append(
@@ -125,6 +139,19 @@ class ControlRuntime:
 
     def shutdown(self) -> None:
         self.backend.shutdown()
+
+    def update_config(
+        self,
+        *,
+        delta_t: float | None = None,
+        history_seconds: float | None = None,
+    ) -> None:
+        if delta_t is not None:
+            self.config.delta_t = delta_t
+        if history_seconds is not None:
+            self.config.history_seconds = history_seconds
+        self.history.history_seconds = self.config.history_seconds
+        self.history.prune()
 
     def _advance(
         self, q1: float, q2: float, sp1_c: float, sp2_c: float

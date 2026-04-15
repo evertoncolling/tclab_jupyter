@@ -340,3 +340,98 @@ def test_runner_captures_mpc_failure() -> None:
     runner.poll()
 
     assert isinstance(runner.worker_error, ControllerSolveError)
+
+
+def test_runner_updates_active_runtime_config_immediately() -> None:
+    notebook_session_state, _notebook_view, notebook_runner, _wi, _bq = (
+        _load_ui_components()
+    )
+    state = notebook_session_state()
+    updates: list[tuple[float | None, float | None]] = []
+
+    class FakeRuntime:
+        def initialize(
+            self, q1: float, q2: float, sp1_c: float, sp2_c: float
+        ) -> RuntimeSnapshot:
+            return RuntimeSnapshot(
+                time_s=np.array([0.0]),
+                q1=np.array([q1]),
+                q2=np.array([q2]),
+                t1_c=np.array([22.0]),
+                t2_c=np.array([22.0]),
+                sp1_c=np.array([sp1_c]),
+                sp2_c=np.array([sp2_c]),
+            )
+
+        def shutdown(self) -> None:
+            return
+
+        def update_config(
+            self,
+            *,
+            delta_t: float | None = None,
+            history_seconds: float | None = None,
+        ) -> None:
+            updates.append((delta_t, history_seconds))
+
+    runner = notebook_runner(
+        state=state,
+        backend_factory=lambda: cast(Any, None),
+        on_snapshot=lambda snapshot: None,
+        on_running_change=lambda running: None,
+        runtime_factory=lambda config: FakeRuntime(),
+    )
+
+    runner._runtime = FakeRuntime()
+    state.delta_t = 2.5
+    runner.update_runtime_config()
+
+    assert updates == [(2.5, state.history_seconds)]
+
+
+def test_runner_mpc_loop_reads_updated_config_each_iteration() -> None:
+    notebook_session_state, _notebook_view, notebook_runner, _wi, _bq = (
+        _load_ui_components()
+    )
+    state = notebook_session_state(mode="MPC")
+    seen_solvers: list[str] = []
+
+    class FakeRuntime:
+        def step_mpc(
+            self,
+            q1: float,
+            q2: float,
+            sp1_c: float,
+            sp2_c: float,
+            config: Any,
+        ) -> tuple[RuntimeSnapshot, float, float]:
+            seen_solvers.append(config.solver)
+            if len(seen_solvers) == 1:
+                state.solver = "3 - IPOPT"
+            else:
+                runner._stop_event.set()
+            return (
+                RuntimeSnapshot(
+                    time_s=np.array([0.0]),
+                    q1=np.array([q1]),
+                    q2=np.array([q2]),
+                    t1_c=np.array([22.0]),
+                    t2_c=np.array([22.0]),
+                    sp1_c=np.array([sp1_c]),
+                    sp2_c=np.array([sp2_c]),
+                ),
+                q1,
+                q2,
+            )
+
+    runner = notebook_runner(
+        state=state,
+        backend_factory=lambda: cast(Any, None),
+        on_snapshot=lambda snapshot: None,
+        on_running_change=lambda running: None,
+    )
+    state.sleep_s = 0.0
+
+    runner._loop_mpc(FakeRuntime())
+
+    assert seen_solvers == ["1 - APOPT", "3 - IPOPT"]

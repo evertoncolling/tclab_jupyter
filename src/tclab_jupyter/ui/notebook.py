@@ -46,6 +46,13 @@ class RuntimeLike(Protocol):
 
     def shutdown(self) -> None: ...
 
+    def update_config(
+        self,
+        *,
+        delta_t: float | None = None,
+        history_seconds: float | None = None,
+    ) -> None: ...
+
     def step_manual(self, q1: float, q2: float) -> RuntimeSnapshot: ...
 
     def step_on_off(
@@ -688,45 +695,166 @@ class NotebookView:
             [
                 self.wi.VBox(
                     (
-                        self._config_row("&Delta;t (s):", general_delta, width="120px", margin="0 20px 0 0"),
-                        self._config_row("Sleep time (s):", general_sleep, width="120px", margin="0 20px 0 0"),
-                    )
+                        self._config_row(
+                            "&Delta;t (s):",
+                            general_delta,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_row(
+                            "Sleep time (s):",
+                            general_sleep,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                    ),
+                    layout=self.wi.Layout(align_items="flex-start", padding="20px 30px"),
                 ),
                 self.wi.VBox(
                     (
-                        self._config_row("Deadband (K):", onoff_q1_deadband, width="90px", margin="0 10px 0 15px"),
-                        self._config_row("Deadband (K):", onoff_q2_deadband, width="90px", margin="0 10px 0 15px"),
-                    )
+                        self._config_section_title("T1 Controller"),
+                        self._config_row(
+                            "Deadband (K):",
+                            onoff_q1_deadband,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_spacer(),
+                        self._config_section_title("T2 Controller"),
+                        self._config_row(
+                            "Deadband (K):",
+                            onoff_q2_deadband,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                    ),
+                    layout=self.wi.Layout(align_items="flex-start", padding="20px 30px"),
                 ),
                 self.wi.VBox(
                     (
-                        self._config_row("Kc (K/%Heater):", pid1_gain, width="100px", margin="0 10px 0 15px"),
-                        self._config_row("tauI (s):", pid1_reset, width="100px", margin="0 10px 0 15px"),
-                        self._config_row("tauD (s):", pid1_rate, width="100px", margin="0 10px 0 15px"),
-                        self._config_row("Kc (K/%Heater):", pid2_gain, width="100px", margin="0 10px 0 15px"),
-                        self._config_row("tauI (s):", pid2_reset, width="100px", margin="0 10px 0 15px"),
-                        self._config_row("tauD (s):", pid2_rate, width="100px", margin="0 10px 0 15px"),
-                    )
+                        self._config_section_title("T1 Controller"),
+                        self._config_row(
+                            "Kc (K/%Heater):",
+                            pid1_gain,
+                            width="220px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_row(
+                            "tauI (s):",
+                            pid1_reset,
+                            width="220px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_row(
+                            "tauD (s):",
+                            pid1_rate,
+                            width="220px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_spacer(),
+                        self._config_section_title("T2 Controller"),
+                        self._config_row(
+                            "Kc (K/%Heater):",
+                            pid2_gain,
+                            width="220px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_row(
+                            "tauI (s):",
+                            pid2_reset,
+                            width="220px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_row(
+                            "tauD (s):",
+                            pid2_rate,
+                            width="220px",
+                            margin="0 20px 0 0",
+                        ),
+                    ),
+                    layout=self.wi.Layout(align_items="flex-start", padding="20px 30px"),
                 ),
                 self.wi.VBox(
                     (
                         self.wi.HBox(
                             (
-                                self._config_label("SOLVER:", width="60px", margin="0 10px 0 25px"),
+                                self._config_label(
+                                    "SOLVER:",
+                                    width="120px",
+                                    margin="0 15px 0 0",
+                                ),
                                 mpc_solver,
-                                self._config_label("CVTYPE:", width="60px", margin="0 10px 0 25px"),
+                                self._config_label(
+                                    "CVTYPE:",
+                                    width="120px",
+                                    margin="0 15px 0 25px",
+                                ),
                                 mpc_cvtype,
-                            )
+                            ),
+                            layout=self.wi.Layout(
+                                align_items="center",
+                                width="100%",
+                                justify_content="flex-start",
+                            ),
                         ),
-                        self._config_row("Deadband (K):", mpc_t1_dt, width="95px", margin="0 20px 0 10px"),
-                        self._config_row("TAU:", mpc_t1_tau, width="95px", margin="0 20px 0 10px"),
-                        self._config_row("Deadband (K):", mpc_t2_dt, width="95px", margin="0 20px 0 10px"),
-                        self._config_row("TAU:", mpc_t2_tau, width="95px", margin="0 20px 0 10px"),
-                        self._config_row("DMAX:", mpc_q1_dmax, width="55px", margin="0 20px 0 10px"),
-                        self._config_row("DCOST:", mpc_q1_dcost, width="55px", margin="0 20px 0 10px"),
-                        self._config_row("DMAX:", mpc_q2_dmax, width="55px", margin="0 20px 0 10px"),
-                        self._config_row("DCOST:", mpc_q2_dcost, width="55px", margin="0 20px 0 10px"),
-                    )
+                        self._config_spacer(),
+                        self._config_section_title("T1 Controller"),
+                        self._config_row(
+                            "Deadband (K):",
+                            mpc_t1_dt,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_row(
+                            "TAU:",
+                            mpc_t1_tau,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_spacer(),
+                        self._config_section_title("T2 Controller"),
+                        self._config_row(
+                            "Deadband (K):",
+                            mpc_t2_dt,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_row(
+                            "TAU:",
+                            mpc_t2_tau,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_spacer(),
+                        self._config_section_title("Q1 Move Limits"),
+                        self._config_row(
+                            "DMAX:",
+                            mpc_q1_dmax,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_row(
+                            "DCOST:",
+                            mpc_q1_dcost,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_spacer(),
+                        self._config_section_title("Q2 Move Limits"),
+                        self._config_row(
+                            "DMAX:",
+                            mpc_q2_dmax,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                        self._config_row(
+                            "DCOST:",
+                            mpc_q2_dcost,
+                            width="180px",
+                            margin="0 20px 0 0",
+                        ),
+                    ),
+                    layout=self.wi.Layout(align_items="flex-start", padding="20px 30px"),
                 ),
             ],
             layout=self.wi.Layout(width="800px", height="380px"),
@@ -881,12 +1009,44 @@ class NotebookView:
 
     def _config_label(self, text: str, *, width: str, margin: str) -> Any:
         return self.wi.HTML(
-            value=f'<p style="text-align: right;"><b>{text}</b></p>',
-            layout=self.wi.Layout(width=width, margin=margin),
+            value=(
+                f'<p style="margin: 0; text-align: right; line-height: 32px; white-space: nowrap;">'
+                f"<b>{text}</b></p>"
+            ),
+            layout=self.wi.Layout(
+                width=width,
+                min_width=width,
+                margin=margin,
+                display="flex",
+                align_items="center",
+                justify_content="flex-end",
+            ),
+        )
+
+    def _config_section_title(self, text: str) -> Any:
+        return self.wi.HTML(
+            value=(
+                f'<p style="margin: 0 0 6px 0; text-align: left; '
+                f'font-size: 16px; font-weight: 700;">{text}</p>'
+            ),
+            layout=self.wi.Layout(width="100%"),
+        )
+
+    def _config_spacer(self) -> Any:
+        return self.wi.HTML(
+            value="",
+            layout=self.wi.Layout(height="12px"),
         )
 
     def _config_row(self, label: str, widget: Any, *, width: str, margin: str) -> Any:
-        return self.wi.HBox((self._config_label(label, width=width, margin=margin), widget))
+        return self.wi.HBox(
+            (self._config_label(label, width=width, margin=margin), widget),
+            layout=self.wi.Layout(
+                align_items="center",
+                width="100%",
+                justify_content="flex-start",
+            ),
+        )
 
 
 class NotebookRunner:
@@ -978,6 +1138,15 @@ class NotebookRunner:
             return
         self._shutdown_runtime()
 
+    def update_runtime_config(self) -> None:
+        runtime = self._runtime
+        if runtime is None:
+            return
+        runtime.update_config(
+            delta_t=self._state.delta_t,
+            history_seconds=self._state.history_seconds,
+        )
+
     def _initialize_runtime(self) -> None:
         if self._runtime is not None:
             return
@@ -1055,8 +1224,8 @@ class NotebookRunner:
                 break
 
     def _loop_mpc(self, runtime: RuntimeLike) -> None:
-        config = self._state.mpc_config()
         while not self._stop_event.is_set():
+            config = self._state.mpc_config()
             snapshot, self._state.q1, self._state.q2 = runtime.step_mpc(
                 self._state.q1,
                 self._state.q2,
@@ -1270,7 +1439,7 @@ class _NotebookApp:
 
     def _sync_general_delta(self, change: dict[str, object]) -> None:
         self.state.delta_t = _coerce_float(change["new"])
-        self.runner.invalidate_runtime()
+        self.runner.update_runtime_config()
 
     def _sync_general_sleep(self, change: dict[str, object]) -> None:
         self.state.sleep_s = _coerce_float(change["new"])
