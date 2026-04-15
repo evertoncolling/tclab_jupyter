@@ -5,167 +5,335 @@ from __future__ import annotations
 import importlib
 import queue
 import threading
-from typing import Any
-
-import numpy as np
+from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol, cast
 
 from ..backends import HardwareBackend, SimulationBackend
 from ..controllers import ControllerSolveError, MpcConfig
 from ..runtime import ControlRuntime, RuntimeConfig, RuntimeSnapshot
+
+Mode = Literal["Manual", "On-Off", "PID", "MPC"]
 
 
 def _load_widget_modules() -> tuple[Any, Any, Any]:
     display = importlib.import_module("IPython.display").display
     bq = importlib.import_module("bqplot")
     wi = importlib.import_module("ipywidgets").widgets
-
     return wi, bq, display
 
 
-class _BaseNotebookGUI:
-    def __init__(self, backend_factory) -> None:
-        self._backend_factory = backend_factory
-        self._runtime: ControlRuntime | None = None
-        self._worker: threading.Thread | None = None
-        self._ui_poller = None
-        self._running = False
-        self._suspend_control_updates = False
-        self._stop_event = threading.Event()
-        self._ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-        self._last_rendered_snapshot: RuntimeSnapshot | None = None
-        self._worker_error: BaseException | None = None
+def _create_periodic_callback(callback: Callable[[], None], interval_ms: int) -> Any:
+    periodic_callback = importlib.import_module("tornado.ioloop").PeriodicCallback
+    return periodic_callback(callback, interval_ms)
 
-        wi, bq, display = _load_widget_modules()
-        self._display = display
-        self._wi = wi
-        self._bq = bq
 
-        self._delta_t = 4.0
-        self._history_seconds = 500.0
-        self._sleep = 0.5
-        self._T1_SP = 30.0
-        self._T2_SP = 30.0
-        self._Q10 = 0.0
-        self._Q20 = 0.0
-        self._Tc0 = np.array([293.15, 293.15], dtype=float)
+def _coerce_float(value: object) -> float:
+    return float(cast(float | int | str, value))
 
-        colors = ["#1f77b4", "#5ebdff", "#d62728", "#ff7f0e", "#1f77b4", "#d62728"]
-        self._time_window_min = self._history_seconds / 60.0
-        self._time_scale = bq.LinearScale(min=0.0, max=self._time_window_min)
-        temperature_scale = bq.LinearScale(min=20.0, max=60.0)
-        heater_scale = bq.LinearScale(min=0.0, max=100.0)
-        temperature_scale_set = {"x": self._time_scale, "y": temperature_scale}
-        heater_scale_set = {"x": self._time_scale, "y": heater_scale}
-        ax_x1 = bq.Axis(label="", scale=self._time_scale, visible=False)
-        ax_x2 = bq.Axis(label="time [min]", scale=self._time_scale)
-        ax_T1 = bq.Axis(
+
+def _coerce_mode(value: object) -> Mode:
+    if value not in {"Manual", "On-Off", "PID", "MPC"}:
+        raise ValueError(f"Unsupported notebook mode: {value!r}")
+    return cast(Mode, value)
+
+
+class RuntimeLike(Protocol):
+    def initialize(
+        self, q1: float, q2: float, sp1_c: float, sp2_c: float
+    ) -> RuntimeSnapshot: ...
+
+    def shutdown(self) -> None: ...
+
+    def step_manual(self, q1: float, q2: float) -> RuntimeSnapshot: ...
+
+    def step_on_off(
+        self,
+        q1: float,
+        q2: float,
+        sp1_c: float,
+        sp2_c: float,
+        deadband1: float,
+        deadband2: float,
+    ) -> tuple[RuntimeSnapshot, float, float]: ...
+
+    def step_pid(
+        self,
+        q1: float,
+        q2: float,
+        sp1_c: float,
+        sp2_c: float,
+        gain1: float,
+        reset1: float,
+        rate1: float,
+        gain2: float,
+        reset2: float,
+        rate2: float,
+    ) -> tuple[RuntimeSnapshot, float, float]: ...
+
+    def step_mpc(
+        self,
+        q1: float,
+        q2: float,
+        sp1_c: float,
+        sp2_c: float,
+        config: MpcConfig,
+    ) -> tuple[RuntimeSnapshot, float, float]: ...
+
+
+@dataclass(slots=True)
+class NotebookSessionState:
+    delta_t: float = 4.0
+    history_seconds: float = 500.0
+    sleep_s: float = 0.5
+    mode: Mode = "Manual"
+    t1_sp: float = 30.0
+    t2_sp: float = 30.0
+    q1: float = 0.0
+    q2: float = 0.0
+    suspend_control_updates: bool = False
+    last_rendered_snapshot: RuntimeSnapshot | None = None
+    worker_error: BaseException | None = None
+    q1_dt_on_off: float = 0.1
+    q2_dt_on_off: float = 0.1
+    pid1_gain: float = 10.0
+    pid1_reset: float = 50.0
+    pid1_rate: float = 1.0
+    pid2_gain: float = 10.0
+    pid2_reset: float = 50.0
+    pid2_rate: float = 1.0
+    solver: str = "1 - APOPT"
+    cvtype: str = "1 - Deadband"
+    t1_dt: float = 0.1
+    t1_tau: float = 10.0
+    t2_dt: float = 0.1
+    t2_tau: float = 10.0
+    q1_dmax: float = 30.0
+    q1_dcost: float = 1.0
+    q2_dmax: float = 30.0
+    q2_dcost: float = 1.0
+
+    @contextmanager
+    def suspended_updates(self):
+        self.suspend_control_updates = True
+        try:
+            yield
+        finally:
+            self.suspend_control_updates = False
+
+    @property
+    def time_window_min(self) -> float:
+        return self.history_seconds / 60.0
+
+    @property
+    def is_manual_mode(self) -> bool:
+        return self.mode == "Manual"
+
+    def runtime_config(self) -> RuntimeConfig:
+        return RuntimeConfig(delta_t=self.delta_t, history_seconds=self.history_seconds)
+
+    def mpc_config(self) -> MpcConfig:
+        return MpcConfig(
+            solver=self.solver,
+            cvtype=self.cvtype,
+            t1_deadband=self.t1_dt,
+            t1_tau=self.t1_tau,
+            t2_deadband=self.t2_dt,
+            t2_tau=self.t2_tau,
+            q1_dmax=self.q1_dmax,
+            q1_dcost=self.q1_dcost,
+            q2_dmax=self.q2_dmax,
+            q2_dcost=self.q2_dcost,
+        )
+
+    def reset_for_mode(self, mode: Mode) -> None:
+        self.mode = mode
+        self.t1_sp = 30.0
+        self.t2_sp = 30.0
+        self.q1 = 0.0
+        self.q2 = 0.0
+        self.worker_error = None
+        self.last_rendered_snapshot = None
+
+
+@dataclass(slots=True)
+class NotebookWidgets:
+    app_root: Any
+    config_root: Any
+    mode: Any
+    start_button: Any
+    stop_button: Any
+    time_scale: Any
+    t1_meas: Any
+    t2_meas: Any
+    t1_set_point: Any
+    t2_set_point: Any
+    u1: Any
+    u2: Any
+    pt1: Any
+    lt1: Any
+    pt2: Any
+    lt2: Any
+    q1_slider: Any
+    q1_text: Any
+    q1_button: Any
+    q2_slider: Any
+    q2_text: Any
+    q2_button: Any
+    t1_slider: Any
+    t1_text: Any
+    t1_button: Any
+    t2_slider: Any
+    t2_text: Any
+    t2_button: Any
+    general_delta: Any
+    general_sleep: Any
+    onoff_q1_deadband: Any
+    onoff_q2_deadband: Any
+    pid1_gain: Any
+    pid1_reset: Any
+    pid1_rate: Any
+    pid2_gain: Any
+    pid2_reset: Any
+    pid2_rate: Any
+    mpc_solver: Any
+    mpc_cvtype: Any
+    mpc_t1_dt: Any
+    mpc_t1_tau: Any
+    mpc_t2_dt: Any
+    mpc_t2_tau: Any
+    mpc_q1_dmax: Any
+    mpc_q1_dcost: Any
+    mpc_q2_dmax: Any
+    mpc_q2_dcost: Any
+
+
+@dataclass(slots=True)
+class NotebookView:
+    wi: Any
+    bq: Any
+    widgets: NotebookWidgets | None = None
+    _colors: list[str] = field(
+        default_factory=lambda: [
+            "#1f77b4",
+            "#5ebdff",
+            "#d62728",
+            "#ff7f0e",
+            "#1f77b4",
+            "#d62728",
+        ]
+    )
+
+    def build(self, state: NotebookSessionState) -> NotebookWidgets:
+        style = {"description_width": "initial"}
+        time_scale = self.bq.LinearScale(min=0.0, max=state.time_window_min)
+        temperature_scale = self.bq.LinearScale(min=20.0, max=60.0)
+        heater_scale = self.bq.LinearScale(min=0.0, max=100.0)
+        temperature_scale_set = {"x": time_scale, "y": temperature_scale}
+        heater_scale_set = {"x": time_scale, "y": heater_scale}
+
+        ax_x1 = self.bq.Axis(label="", scale=time_scale, visible=False)
+        ax_x2 = self.bq.Axis(label="time [min]", scale=time_scale)
+        ax_t1 = self.bq.Axis(
             label="Temperature 1 [C]",
             scale=temperature_scale,
             orientation="vertical",
-            label_color=colors[0],
+            label_color=self._colors[0],
         )
-        ax_T2 = bq.Axis(
+        ax_t2 = self.bq.Axis(
             label="Temperature 2 [C]",
             scale=temperature_scale,
             orientation="vertical",
-            label_color=colors[2],
+            label_color=self._colors[2],
         )
-        ax_Q = bq.Axis(
+        ax_q = self.bq.Axis(
             label="Heater Output [%]",
             scale=heater_scale,
             orientation="vertical",
             label_color="black",
         )
-        self._T1_meas = bq.Scatter(
+
+        t1_meas = self.bq.Scatter(
             x=[],
             y=[],
             scales=temperature_scale_set,
             marker="circle",
-            colors=[colors[0]],
+            colors=[self._colors[0]],
             default_size=20,
         )
-        self._T2_meas = bq.Scatter(
+        t2_meas = self.bq.Scatter(
             x=[],
             y=[],
             scales=temperature_scale_set,
             marker="circle",
-            colors=[colors[2]],
+            colors=[self._colors[2]],
             default_size=20,
         )
-        self._T1_set_point = bq.Lines(
+        t1_set_point = self.bq.Lines(
             x=[],
             y=[],
             scales=temperature_scale_set,
             stroke_width=4,
-            colors=[colors[1]],
+            colors=[self._colors[1]],
             interpolation="step-before",
         )
-        self._T2_set_point = bq.Lines(
+        t2_set_point = self.bq.Lines(
             x=[],
             y=[],
             scales=temperature_scale_set,
             stroke_width=4,
-            colors=[colors[3]],
+            colors=[self._colors[3]],
             interpolation="step-before",
         )
-        self._u1 = bq.Lines(
+        u1 = self.bq.Lines(
             x=[],
             y=[],
             scales=heater_scale_set,
             stroke_width=2,
-            colors=[colors[4]],
+            colors=[self._colors[4]],
             interpolation="step-before",
             display_legend=True,
             labels=["Heater 1"],
         )
-        self._u2 = bq.Lines(
+        u2 = self.bq.Lines(
             x=[],
             y=[],
             scales=heater_scale_set,
             stroke_width=2,
-            colors=[colors[5]],
+            colors=[self._colors[5]],
             interpolation="step-before",
             display_legend=True,
             labels=["Heater 2"],
         )
 
-        fig_lay_up = wi.Layout(width="400px", height="240px")
-        fig_lay_down = wi.Layout(width="400px", height="290px")
-        fig1 = bq.Figure(layout=fig_lay_up, axes=[ax_x1, ax_T1], marks=[self._T1_meas, self._T1_set_point], fig_margin=dict(top=10, bottom=0, left=60, right=5))
-        fig2 = bq.Figure(layout=fig_lay_up, axes=[ax_x1, ax_T2], marks=[self._T2_meas, self._T2_set_point], fig_margin=dict(top=10, bottom=0, left=60, right=20))
-        fig3 = bq.Figure(
-            layout=fig_lay_down,
-            axes=[ax_x2, ax_Q],
-            marks=[self._u1, self._u2],
+        fig_up = self.wi.Layout(width="400px", height="240px")
+        fig_down = self.wi.Layout(width="400px", height="290px")
+        fig1 = self.bq.Figure(
+            layout=fig_up,
+            axes=[ax_x1, ax_t1],
+            marks=[t1_meas, t1_set_point],
+            fig_margin=dict(top=10, bottom=0, left=60, right=5),
+        )
+        fig2 = self.bq.Figure(
+            layout=fig_up,
+            axes=[ax_x1, ax_t2],
+            marks=[t2_meas, t2_set_point],
+            fig_margin=dict(top=10, bottom=0, left=60, right=20),
+        )
+        fig3 = self.bq.Figure(
+            layout=fig_down,
+            axes=[ax_x2, ax_q],
+            marks=[u1, u2],
             fig_margin=dict(top=10, bottom=50, left=60, right=10),
             legend_location="left",
             legend_style={"fill": "white", "fill-opacity": "0.7", "width": "130px"},
         )
 
-        v_space = wi.Label(value="", layout=wi.Layout(height="2px"))
-        h_space = wi.Label(value="", layout=wi.Layout(width="2px"))
+        v_space = self.wi.Label(value="", layout=self.wi.Layout(height="2px"))
+        h_space = self.wi.Label(value="", layout=self.wi.Layout(width="2px"))
 
-        self._q1_dt_on_off = 0.1
-        self._q2_dt_on_off = 0.1
-        self._pid1_gain = 10.0
-        self._pid1_reset = 50.0
-        self._pid1_rate = 1.0
-        self._pid2_gain = 10.0
-        self._pid2_reset = 50.0
-        self._pid2_rate = 1.0
-        self._SOLVER = "1 - APOPT"
-        self._CVTYPE = "1 - Deadband"
-        self._T1_dt = 0.1
-        self._T1_tau = 10.0
-        self._T2_dt = 0.1
-        self._T2_tau = 10.0
-        self._Q1_DMAX = 30.0
-        self._Q1_DCOST = 1.0
-        self._Q2_DMAX = 30.0
-        self._Q2_DCOST = 1.0
-
-        style = {"description_width": "initial"}
-        self._PT1 = wi.FloatProgress(
+        pt1 = self.wi.FloatProgress(
             value=20.0,
             min=0,
             max=100.0,
@@ -174,8 +342,8 @@ class _BaseNotebookGUI:
             orientation="horizontal",
             style=style,
         )
-        self._LT1 = wi.Label(value=self._format_temperature_label(self._PT1.value))
-        self._PT2 = wi.FloatProgress(
+        lt1 = self.wi.Label(value=self.format_temperature_label(pt1.value))
+        pt2 = self.wi.FloatProgress(
             value=20.0,
             min=0,
             max=100.0,
@@ -184,10 +352,10 @@ class _BaseNotebookGUI:
             orientation="horizontal",
             style=style,
         )
-        self._LT2 = wi.Label(value=self._format_temperature_label(self._PT2.value))
+        lt2 = self.wi.Label(value=self.format_temperature_label(pt2.value))
 
-        self._wQ1 = wi.FloatSlider(
-            value=self._Q10,
+        q1_slider = self.wi.FloatSlider(
+            value=state.q1,
             min=0,
             max=100.0,
             step=0.5,
@@ -196,16 +364,20 @@ class _BaseNotebookGUI:
             orientation="horizontal",
             readout=False,
             style=style,
-            layout=wi.Layout(width="230px"),
+            layout=self.wi.Layout(width="230px"),
         )
-        self._tQ1 = wi.BoundedFloatText(value=self._Q10, min=0, max=100.0, step=0.5, layout=wi.Layout(width="60px"))
-        wi.jslink((self._wQ1, "value"), (self._tQ1, "value"))
-        self._bQ1 = wi.Button(description="Set", layout=wi.Layout(width="50px"))
-        self._bQ1.on_click(self._Q1_click)
-        self._wQ1.observe(self._sync_q1, names="value")
+        q1_text = self.wi.BoundedFloatText(
+            value=state.q1,
+            min=0,
+            max=100.0,
+            step=0.5,
+            layout=self.wi.Layout(width="60px"),
+        )
+        self.wi.jslink((q1_slider, "value"), (q1_text, "value"))
+        q1_button = self.wi.Button(description="Set", layout=self.wi.Layout(width="50px"))
 
-        self._wQ2 = wi.FloatSlider(
-            value=self._Q20,
+        q2_slider = self.wi.FloatSlider(
+            value=state.q2,
             min=0,
             max=100.0,
             step=0.5,
@@ -214,16 +386,20 @@ class _BaseNotebookGUI:
             orientation="horizontal",
             readout=False,
             style=style,
-            layout=wi.Layout(width="230px"),
+            layout=self.wi.Layout(width="230px"),
         )
-        self._tQ2 = wi.BoundedFloatText(value=self._Q20, min=0, max=100.0, step=0.5, layout=wi.Layout(width="60px"))
-        wi.jslink((self._wQ2, "value"), (self._tQ2, "value"))
-        self._bQ2 = wi.Button(description="Set", layout=wi.Layout(width="50px"))
-        self._bQ2.on_click(self._Q2_click)
-        self._wQ2.observe(self._sync_q2, names="value")
+        q2_text = self.wi.BoundedFloatText(
+            value=state.q2,
+            min=0,
+            max=100.0,
+            step=0.5,
+            layout=self.wi.Layout(width="60px"),
+        )
+        self.wi.jslink((q2_slider, "value"), (q2_text, "value"))
+        q2_button = self.wi.Button(description="Set", layout=self.wi.Layout(width="50px"))
 
-        self._wT1 = wi.FloatSlider(
-            value=self._T1_SP,
+        t1_slider = self.wi.FloatSlider(
+            value=state.t1_sp,
             min=20,
             max=60.0,
             step=0.5,
@@ -233,286 +409,534 @@ class _BaseNotebookGUI:
             readout=False,
             style=style,
             disabled=True,
-            layout=wi.Layout(width="230px"),
+            layout=self.wi.Layout(width="230px"),
         )
-        self._tT1 = wi.BoundedFloatText(value=self._T1_SP, min=20, max=60.0, step=0.5, disabled=True, layout=wi.Layout(width="60px"))
-        wi.jslink((self._wT1, "value"), (self._tT1, "value"))
-        self._bT1 = wi.Button(description="Set", layout=wi.Layout(width="50px"), disabled=True)
-        self._bT1.on_click(self._T1_click)
-        self._wT1.observe(self._sync_t1_sp, names="value")
+        t1_text = self.wi.BoundedFloatText(
+            value=state.t1_sp,
+            min=20,
+            max=60.0,
+            step=0.5,
+            disabled=True,
+            layout=self.wi.Layout(width="60px"),
+        )
+        self.wi.jslink((t1_slider, "value"), (t1_text, "value"))
+        t1_button = self.wi.Button(
+            description="Set",
+            layout=self.wi.Layout(width="50px"),
+            disabled=True,
+        )
 
-        self._wT2 = wi.FloatSlider(
-            value=self._T2_SP,
+        t2_slider = self.wi.FloatSlider(
+            value=state.t2_sp,
             min=20,
             max=60.0,
             step=0.5,
             description="T2 SP:",
             continuous_update=False,
             orientation="horizontal",
-            disabled=True,
             readout=False,
             style=style,
-            layout=wi.Layout(width="230px"),
+            disabled=True,
+            layout=self.wi.Layout(width="230px"),
         )
-        self._tT2 = wi.BoundedFloatText(value=self._T2_SP, min=20, max=60.0, step=0.5, disabled=True, layout=wi.Layout(width="60px"))
-        wi.jslink((self._wT2, "value"), (self._tT2, "value"))
-        self._bT2 = wi.Button(description="Set", layout=wi.Layout(width="50px"), disabled=True)
-        self._bT2.on_click(self._T2_click)
-        self._wT2.observe(self._sync_t2_sp, names="value")
-
-        self._mode = wi.ToggleButtons(options=["Manual", "On-Off", "PID", "MPC"], style={"button_width": "100px"})
-        self._mode.observe(self._mode_switch, names="value")
-        self._b_stop = wi.Button(description="Stop", button_style="warning", icon="stop", layout=wi.Layout(width="100px", height="32px"))
-        self._b_stop.on_click(self._stop_click)
-        self._b_play = wi.Button(description="Start", button_style="success", icon="play", layout=wi.Layout(width="100px", height="32px"))
-        self._b_play.on_click(self._play_click)
-
-        buttons = wi.HBox((self._b_play, h_space, self._b_stop, wi.Label(value="", layout=wi.Layout(width="165px")), self._mode))
-        Q1_Set = wi.HBox((h_space, self._wQ1, self._tQ1, self._bQ1), layout=wi.Layout(border="solid 2px gray", width="360px"))
-        T1_Set = wi.HBox((h_space, self._wT1, self._tT1, self._bT1), layout=wi.Layout(border="solid 2px gray", width="360px"))
-        T1_View = wi.HBox((h_space, self._PT1, self._LT1), layout=wi.Layout(border="solid 2px gray", width="360px"))
-        Q2_Set = wi.HBox((h_space, self._wQ2, self._tQ2, self._bQ2), layout=wi.Layout(border="solid 2px gray", width="360px"))
-        T2_Set = wi.HBox((h_space, self._wT2, self._tT2, self._bT2), layout=wi.Layout(border="solid 2px gray", width="360px"))
-        T2_View = wi.HBox((h_space, self._PT2, self._LT2), layout=wi.Layout(border="solid 2px gray", width="360px"))
-        co1 = wi.VBox((T1_Set, v_space, T1_View, v_space, Q1_Set))
-        co2 = wi.VBox((T2_Set, v_space, T2_View, v_space, Q2_Set))
-        co = wi.VBox((v_space, v_space, co1, v_space, v_space, v_space, co2))
-        figy = wi.VBox((wi.HBox((fig1, fig2)), v_space, wi.HBox((fig3, h_space, h_space, co))), layout=wi.Layout(border="solid 2px gray", width="800px"))
-        self._gui = wi.VBox((buttons, v_space, figy))
-
-        self._conf11 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>&Delta;t (s):</b></p>', layout=wi.Layout(width="120px", margin="0 20px 0 0")), wi.FloatSlider(value=4.0, min=1.0, max=10.0, step=0.5, description="", style=style)))
-        self._conf12 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>Sleep time (s):</b></p>', layout=wi.Layout(width="120px", margin="0 20px 0 0")), wi.FloatSlider(value=0.5, min=0.25, max=1.5, step=0.05, description="", style=style)))
-        self._conf21 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>Deadband (K):</b></p>', layout=wi.Layout(width="90px", margin="0 10px 0 15px")), wi.FloatSlider(value=0.1, min=0.0, max=2.0, step=0.1, description="", style=style, layout=wi.Layout(width="200px"))))
-        self._conf23 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>Deadband (K):</b></p>', layout=wi.Layout(width="90px", margin="0 10px 0 15px")), wi.FloatSlider(value=0.1, min=0.0, max=2.0, step=0.1, description="", style=style, layout=wi.Layout(width="200px"))))
-        self._conf31 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>Kc (K/%Heater):</b></p>', layout=wi.Layout(width="100px", margin="0 10px 0 15px")), wi.FloatSlider(value=10.0, min=0.0, max=20.0, step=0.5, description="", style=style, layout=wi.Layout(width="200px"))))
-        self._conf32 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>tauI (s):</b></p>', layout=wi.Layout(width="100px", margin="0 10px 0 15px")), wi.FloatSlider(value=50.0, min=0.0, max=200.0, step=1.0, description="", style=style, layout=wi.Layout(width="200px"))))
-        self._conf33 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>tauD (s):</b></p>', layout=wi.Layout(width="100px", margin="0 10px 0 15px")), wi.FloatSlider(value=1.0, min=0.0, max=10.0, step=0.5, description="", style=style, layout=wi.Layout(width="200px"))))
-        self._conf35 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>Kc (K/%Heater):</b></p>', layout=wi.Layout(width="100px", margin="0 10px 0 15px")), wi.FloatSlider(value=10.0, min=0.0, max=20.0, step=0.5, description="", style=style, layout=wi.Layout(width="200px"))))
-        self._conf36 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>tauI (s):</b></p>', layout=wi.Layout(width="100px", margin="0 10px 0 15px")), wi.FloatSlider(value=50.0, min=0.0, max=200.0, step=1.0, description="", style=style, layout=wi.Layout(width="200px"))))
-        self._conf37 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>tauD (s):</b></p>', layout=wi.Layout(width="100px", margin="0 10px 0 15px")), wi.FloatSlider(value=1.0, min=0.0, max=10.0, step=0.5, description="", style=style, layout=wi.Layout(width="200px"))))
-        self._conf40 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>SOLVER:</b></p>', layout=wi.Layout(width="60px", margin="0 10px 0 25px")), wi.Dropdown(options=["1 - APOPT", "2 - BPOPT", "3 - IPOPT"], value="1 - APOPT", layout=wi.Layout(width="100px")), wi.HTML(value='<p style="text-align: right;"><b>CVTYPE:</b></p>', layout=wi.Layout(width="60px", margin="0 10px 0 25px")), wi.Dropdown(options=["1 - Deadband", "2 - Trajectory"], value="1 - Deadband", layout=wi.Layout(width="130px"))))
-        self._conf42 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>Deadband (K):</b></p>', layout=wi.Layout(width="95px", margin="0 20px 0 10px")), wi.FloatSlider(value=0.1, min=0.1, max=1.0, step=0.1, description="", style=style, layout=wi.Layout(width="250px"))))
-        self._conf43 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>TAU:</b></p>', layout=wi.Layout(width="95px", margin="0 20px 0 10px")), wi.FloatSlider(value=10.0, min=1.0, max=100.0, step=1.0, description="", style=style, layout=wi.Layout(width="250px"))))
-        self._conf45 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>Deadband (K):</b></p>', layout=wi.Layout(width="95px", margin="0 20px 0 10px")), wi.FloatSlider(value=0.1, min=0.1, max=1.0, step=0.1, description="", style=style, layout=wi.Layout(width="250px"))))
-        self._conf46 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>TAU:</b></p>', layout=wi.Layout(width="95px", margin="0 20px 0 10px")), wi.FloatSlider(value=10.0, min=1.0, max=100.0, step=1.0, description="", style=style, layout=wi.Layout(width="250px"))))
-        self._conf48 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>DMAX:</b></p>', layout=wi.Layout(width="55px", margin="0 20px 0 10px")), wi.FloatSlider(value=30.0, min=1.0, max=100.0, step=0.5, description="", style=style, layout=wi.Layout(width="250px"))))
-        self._conf49 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>DCOST:</b></p>', layout=wi.Layout(width="55px", margin="0 20px 0 10px")), wi.FloatSlider(value=1.0, min=0.0, max=10.0, step=0.1, description="", style=style, layout=wi.Layout(width="250px"))))
-        self._conf411 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>DMAX:</b></p>', layout=wi.Layout(width="55px", margin="0 20px 0 10px")), wi.FloatSlider(value=30.0, min=1.0, max=100.0, step=0.5, description="", style=style, layout=wi.Layout(width="250px"))))
-        self._conf412 = wi.HBox((wi.HTML(value='<p style="text-align: right;"><b>DCOST:</b></p>', layout=wi.Layout(width="55px", margin="0 20px 0 10px")), wi.FloatSlider(value=1.0, min=0.0, max=10.0, step=0.1, description="", style=style, layout=wi.Layout(width="250px"))))
-        self._conf = wi.Tab([wi.VBox((self._conf11, self._conf12)), wi.VBox((self._conf21, self._conf23)), wi.VBox((self._conf31, self._conf32, self._conf33, self._conf35, self._conf36, self._conf37)), wi.VBox((self._conf40, self._conf42, self._conf43, self._conf45, self._conf46, self._conf48, self._conf49, self._conf411, self._conf412))], layout=wi.Layout(width="800px", height="380px"))
-        self._conf.set_title(0, "General Options")
-        self._conf.set_title(1, "On-Off Options")
-        self._conf.set_title(2, "PID Options")
-        self._conf.set_title(3, "MPC Options")
-
-    def app(self) -> None:
-        self._display(self._gui)
-
-    def config(self) -> None:
-        self._display(self._conf)
-
-    def _build_runtime(self) -> ControlRuntime:
-        return ControlRuntime(
-            self._backend_factory(),
-            RuntimeConfig(delta_t=self._delta_t, history_seconds=self._history_seconds),
+        t2_text = self.wi.BoundedFloatText(
+            value=state.t2_sp,
+            min=20,
+            max=60.0,
+            step=0.5,
+            disabled=True,
+            layout=self.wi.Layout(width="60px"),
+        )
+        self.wi.jslink((t2_slider, "value"), (t2_text, "value"))
+        t2_button = self.wi.Button(
+            description="Set",
+            layout=self.wi.Layout(width="50px"),
+            disabled=True,
         )
 
-    def _clear_ui_queue(self) -> None:
-        while True:
-            try:
-                self._ui_queue.get_nowait()
-            except queue.Empty:
-                return
+        mode = self.wi.ToggleButtons(
+            options=["Manual", "On-Off", "PID", "MPC"],
+            style={"button_width": "100px"},
+        )
+        start_button = self.wi.Button(
+            description="Start",
+            button_style="success",
+            icon="play",
+            layout=self.wi.Layout(width="100px", height="32px"),
+        )
+        stop_button = self.wi.Button(
+            description="Stop",
+            button_style="warning",
+            icon="stop",
+            layout=self.wi.Layout(width="100px", height="32px"),
+        )
 
-    def _initialize_runtime(self) -> None:
-        if self._runtime is not None:
-            return
-        self._runtime = self._build_runtime()
-        initial = self._runtime.initialize(self._Q10, self._Q20, self._T1_SP, self._T2_SP)
-        self._render(initial)
+        buttons = self.wi.HBox(
+            (
+                start_button,
+                h_space,
+                stop_button,
+                self.wi.Label(value="", layout=self.wi.Layout(width="165px")),
+                mode,
+            )
+        )
+        q1_set = self.wi.HBox(
+            (h_space, q1_slider, q1_text, q1_button),
+            layout=self.wi.Layout(border="solid 2px gray", width="360px"),
+        )
+        t1_set = self.wi.HBox(
+            (h_space, t1_slider, t1_text, t1_button),
+            layout=self.wi.Layout(border="solid 2px gray", width="360px"),
+        )
+        t1_view = self.wi.HBox(
+            (h_space, pt1, lt1),
+            layout=self.wi.Layout(border="solid 2px gray", width="360px"),
+        )
+        q2_set = self.wi.HBox(
+            (h_space, q2_slider, q2_text, q2_button),
+            layout=self.wi.Layout(border="solid 2px gray", width="360px"),
+        )
+        t2_set = self.wi.HBox(
+            (h_space, t2_slider, t2_text, t2_button),
+            layout=self.wi.Layout(border="solid 2px gray", width="360px"),
+        )
+        t2_view = self.wi.HBox(
+            (h_space, pt2, lt2),
+            layout=self.wi.Layout(border="solid 2px gray", width="360px"),
+        )
+        co1 = self.wi.VBox((t1_set, v_space, t1_view, v_space, q1_set))
+        co2 = self.wi.VBox((t2_set, v_space, t2_view, v_space, q2_set))
+        controls = self.wi.VBox((v_space, v_space, co1, v_space, v_space, v_space, co2))
+        figures = self.wi.VBox(
+            (self.wi.HBox((fig1, fig2)), v_space, self.wi.HBox((fig3, h_space, h_space, controls))),
+            layout=self.wi.Layout(border="solid 2px gray", width="800px"),
+        )
+        app_root = self.wi.VBox((buttons, v_space, figures))
 
-    def _enqueue_snapshot(self, snapshot: RuntimeSnapshot) -> None:
-        self._ui_queue.put(("snapshot", snapshot))
+        general_delta = self.wi.FloatSlider(
+            value=state.delta_t,
+            min=1.0,
+            max=10.0,
+            step=0.5,
+            description="",
+            style=style,
+        )
+        general_sleep = self.wi.FloatSlider(
+            value=state.sleep_s,
+            min=0.25,
+            max=1.5,
+            step=0.05,
+            description="",
+            style=style,
+        )
+        onoff_q1_deadband = self.wi.FloatSlider(
+            value=state.q1_dt_on_off,
+            min=0.0,
+            max=2.0,
+            step=0.1,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="200px"),
+        )
+        onoff_q2_deadband = self.wi.FloatSlider(
+            value=state.q2_dt_on_off,
+            min=0.0,
+            max=2.0,
+            step=0.1,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="200px"),
+        )
+        pid1_gain = self.wi.FloatSlider(
+            value=state.pid1_gain,
+            min=0.0,
+            max=20.0,
+            step=0.5,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="200px"),
+        )
+        pid1_reset = self.wi.FloatSlider(
+            value=state.pid1_reset,
+            min=0.0,
+            max=200.0,
+            step=1.0,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="200px"),
+        )
+        pid1_rate = self.wi.FloatSlider(
+            value=state.pid1_rate,
+            min=0.0,
+            max=10.0,
+            step=0.5,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="200px"),
+        )
+        pid2_gain = self.wi.FloatSlider(
+            value=state.pid2_gain,
+            min=0.0,
+            max=20.0,
+            step=0.5,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="200px"),
+        )
+        pid2_reset = self.wi.FloatSlider(
+            value=state.pid2_reset,
+            min=0.0,
+            max=200.0,
+            step=1.0,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="200px"),
+        )
+        pid2_rate = self.wi.FloatSlider(
+            value=state.pid2_rate,
+            min=0.0,
+            max=10.0,
+            step=0.5,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="200px"),
+        )
+        mpc_solver = self.wi.Dropdown(
+            options=["1 - APOPT", "2 - BPOPT", "3 - IPOPT"],
+            value=state.solver,
+            layout=self.wi.Layout(width="100px"),
+        )
+        mpc_cvtype = self.wi.Dropdown(
+            options=["1 - Deadband", "2 - Trajectory"],
+            value=state.cvtype,
+            layout=self.wi.Layout(width="130px"),
+        )
+        mpc_t1_dt = self.wi.FloatSlider(
+            value=state.t1_dt,
+            min=0.1,
+            max=1.0,
+            step=0.1,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="250px"),
+        )
+        mpc_t1_tau = self.wi.FloatSlider(
+            value=state.t1_tau,
+            min=1.0,
+            max=100.0,
+            step=1.0,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="250px"),
+        )
+        mpc_t2_dt = self.wi.FloatSlider(
+            value=state.t2_dt,
+            min=0.1,
+            max=1.0,
+            step=0.1,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="250px"),
+        )
+        mpc_t2_tau = self.wi.FloatSlider(
+            value=state.t2_tau,
+            min=1.0,
+            max=100.0,
+            step=1.0,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="250px"),
+        )
+        mpc_q1_dmax = self.wi.FloatSlider(
+            value=state.q1_dmax,
+            min=1.0,
+            max=100.0,
+            step=0.5,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="250px"),
+        )
+        mpc_q1_dcost = self.wi.FloatSlider(
+            value=state.q1_dcost,
+            min=0.0,
+            max=10.0,
+            step=0.1,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="250px"),
+        )
+        mpc_q2_dmax = self.wi.FloatSlider(
+            value=state.q2_dmax,
+            min=1.0,
+            max=100.0,
+            step=0.5,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="250px"),
+        )
+        mpc_q2_dcost = self.wi.FloatSlider(
+            value=state.q2_dcost,
+            min=0.0,
+            max=10.0,
+            step=0.1,
+            description="",
+            style=style,
+            layout=self.wi.Layout(width="250px"),
+        )
 
-    def _enqueue_error(self, exc: BaseException) -> None:
-        self._ui_queue.put(("error", exc))
+        config_root = self.wi.Tab(
+            [
+                self.wi.VBox(
+                    (
+                        self._config_row("&Delta;t (s):", general_delta, width="120px", margin="0 20px 0 0"),
+                        self._config_row("Sleep time (s):", general_sleep, width="120px", margin="0 20px 0 0"),
+                    )
+                ),
+                self.wi.VBox(
+                    (
+                        self._config_row("Deadband (K):", onoff_q1_deadband, width="90px", margin="0 10px 0 15px"),
+                        self._config_row("Deadband (K):", onoff_q2_deadband, width="90px", margin="0 10px 0 15px"),
+                    )
+                ),
+                self.wi.VBox(
+                    (
+                        self._config_row("Kc (K/%Heater):", pid1_gain, width="100px", margin="0 10px 0 15px"),
+                        self._config_row("tauI (s):", pid1_reset, width="100px", margin="0 10px 0 15px"),
+                        self._config_row("tauD (s):", pid1_rate, width="100px", margin="0 10px 0 15px"),
+                        self._config_row("Kc (K/%Heater):", pid2_gain, width="100px", margin="0 10px 0 15px"),
+                        self._config_row("tauI (s):", pid2_reset, width="100px", margin="0 10px 0 15px"),
+                        self._config_row("tauD (s):", pid2_rate, width="100px", margin="0 10px 0 15px"),
+                    )
+                ),
+                self.wi.VBox(
+                    (
+                        self.wi.HBox(
+                            (
+                                self._config_label("SOLVER:", width="60px", margin="0 10px 0 25px"),
+                                mpc_solver,
+                                self._config_label("CVTYPE:", width="60px", margin="0 10px 0 25px"),
+                                mpc_cvtype,
+                            )
+                        ),
+                        self._config_row("Deadband (K):", mpc_t1_dt, width="95px", margin="0 20px 0 10px"),
+                        self._config_row("TAU:", mpc_t1_tau, width="95px", margin="0 20px 0 10px"),
+                        self._config_row("Deadband (K):", mpc_t2_dt, width="95px", margin="0 20px 0 10px"),
+                        self._config_row("TAU:", mpc_t2_tau, width="95px", margin="0 20px 0 10px"),
+                        self._config_row("DMAX:", mpc_q1_dmax, width="55px", margin="0 20px 0 10px"),
+                        self._config_row("DCOST:", mpc_q1_dcost, width="55px", margin="0 20px 0 10px"),
+                        self._config_row("DMAX:", mpc_q2_dmax, width="55px", margin="0 20px 0 10px"),
+                        self._config_row("DCOST:", mpc_q2_dcost, width="55px", margin="0 20px 0 10px"),
+                    )
+                ),
+            ],
+            layout=self.wi.Layout(width="800px", height="380px"),
+        )
+        config_root.set_title(0, "General Options")
+        config_root.set_title(1, "On-Off Options")
+        config_root.set_title(2, "PID Options")
+        config_root.set_title(3, "MPC Options")
 
-    def _drain_ui_queue(self) -> None:
-        while True:
-            try:
-                event_type, payload = self._ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            if event_type == "snapshot":
-                self._render(payload)
-            elif event_type == "error":
-                self._worker_error = payload
-                self._stop_event.set()
-                self._running = False
+        self.widgets = NotebookWidgets(
+            app_root=app_root,
+            config_root=config_root,
+            mode=mode,
+            start_button=start_button,
+            stop_button=stop_button,
+            time_scale=time_scale,
+            t1_meas=t1_meas,
+            t2_meas=t2_meas,
+            t1_set_point=t1_set_point,
+            t2_set_point=t2_set_point,
+            u1=u1,
+            u2=u2,
+            pt1=pt1,
+            lt1=lt1,
+            pt2=pt2,
+            lt2=lt2,
+            q1_slider=q1_slider,
+            q1_text=q1_text,
+            q1_button=q1_button,
+            q2_slider=q2_slider,
+            q2_text=q2_text,
+            q2_button=q2_button,
+            t1_slider=t1_slider,
+            t1_text=t1_text,
+            t1_button=t1_button,
+            t2_slider=t2_slider,
+            t2_text=t2_text,
+            t2_button=t2_button,
+            general_delta=general_delta,
+            general_sleep=general_sleep,
+            onoff_q1_deadband=onoff_q1_deadband,
+            onoff_q2_deadband=onoff_q2_deadband,
+            pid1_gain=pid1_gain,
+            pid1_reset=pid1_reset,
+            pid1_rate=pid1_rate,
+            pid2_gain=pid2_gain,
+            pid2_reset=pid2_reset,
+            pid2_rate=pid2_rate,
+            mpc_solver=mpc_solver,
+            mpc_cvtype=mpc_cvtype,
+            mpc_t1_dt=mpc_t1_dt,
+            mpc_t1_tau=mpc_t1_tau,
+            mpc_t2_dt=mpc_t2_dt,
+            mpc_t2_tau=mpc_t2_tau,
+            mpc_q1_dmax=mpc_q1_dmax,
+            mpc_q1_dcost=mpc_q1_dcost,
+            mpc_q2_dmax=mpc_q2_dmax,
+            mpc_q2_dcost=mpc_q2_dcost,
+        )
+        self.apply_mode(state, running=False)
+        return self.widgets
 
-    def _render(self, snapshot: RuntimeSnapshot) -> None:
-        self._last_rendered_snapshot = snapshot
+    def render(self, snapshot: RuntimeSnapshot, state: NotebookSessionState) -> None:
+        widgets = self.require_widgets()
+        state.last_rendered_snapshot = snapshot
         time_min = snapshot.time_s / 60.0
         latest_time = float(time_min[-1]) if len(time_min) else 0.0
-        window_min = self._history_seconds / 60.0
-        self._time_scale.min = max(0.0, latest_time - window_min)
-        self._time_scale.max = max(window_min, latest_time)
-        self._T1_meas.x = time_min
-        self._T1_meas.y = snapshot.t1_c
-        self._T2_meas.x = time_min
-        self._T2_meas.y = snapshot.t2_c
-        self._T1_set_point.x = time_min
-        self._T1_set_point.y = snapshot.sp1_c
-        self._T2_set_point.x = time_min
-        self._T2_set_point.y = snapshot.sp2_c
-        self._u1.x = time_min
-        self._u1.y = snapshot.q1
-        self._u2.x = time_min
-        self._u2.y = snapshot.q2
-        self._PT1.value = round(float(snapshot.t1_c[-1]), 1)
-        self._PT2.value = round(float(snapshot.t2_c[-1]), 1)
-        self._LT1.value = self._format_temperature_label(self._PT1.value)
-        self._LT2.value = self._format_temperature_label(self._PT2.value)
-        if self._wQ1.disabled:
-            self._set_control_value(self._wQ1, round(float(snapshot.q1[-1]), 1))
-        if self._wQ2.disabled:
-            self._set_control_value(self._wQ2, round(float(snapshot.q2[-1]), 1))
+        widgets.time_scale.min = max(0.0, latest_time - state.time_window_min)
+        widgets.time_scale.max = max(state.time_window_min, latest_time)
+        widgets.t1_meas.x = time_min
+        widgets.t1_meas.y = snapshot.t1_c
+        widgets.t2_meas.x = time_min
+        widgets.t2_meas.y = snapshot.t2_c
+        widgets.t1_set_point.x = time_min
+        widgets.t1_set_point.y = snapshot.sp1_c
+        widgets.t2_set_point.x = time_min
+        widgets.t2_set_point.y = snapshot.sp2_c
+        widgets.u1.x = time_min
+        widgets.u1.y = snapshot.q1
+        widgets.u2.x = time_min
+        widgets.u2.y = snapshot.q2
+        widgets.pt1.value = round(float(snapshot.t1_c[-1]), 1)
+        widgets.pt2.value = round(float(snapshot.t2_c[-1]), 1)
+        widgets.lt1.value = self.format_temperature_label(widgets.pt1.value)
+        widgets.lt2.value = self.format_temperature_label(widgets.pt2.value)
+        if widgets.q1_slider.disabled:
+            self._assign_value(state, widgets.q1_slider, round(float(snapshot.q1[-1]), 1))
+        if widgets.q2_slider.disabled:
+            self._assign_value(state, widgets.q2_slider, round(float(snapshot.q2[-1]), 1))
 
-    def _conf_general(self, _button) -> None:
-        self._delta_t = self._conf11.children[1].value
-        self._sleep = self._conf12.children[1].value
-        self._runtime = None
+    def reset_for_mode(self, state: NotebookSessionState) -> None:
+        widgets = self.require_widgets()
+        for mark in (
+            widgets.t1_meas,
+            widgets.t2_meas,
+            widgets.t1_set_point,
+            widgets.t2_set_point,
+            widgets.u1,
+            widgets.u2,
+        ):
+            mark.x = []
+            mark.y = []
+        widgets.time_scale.min = 0.0
+        widgets.time_scale.max = state.time_window_min
+        widgets.pt1.value = 20.0
+        widgets.pt2.value = 20.0
+        widgets.lt1.value = self.format_temperature_label(widgets.pt1.value)
+        widgets.lt2.value = self.format_temperature_label(widgets.pt2.value)
+        with state.suspended_updates():
+            widgets.t1_slider.value = state.t1_sp
+            widgets.t2_slider.value = state.t2_sp
+            widgets.q1_slider.value = state.q1
+            widgets.q2_slider.value = state.q2
+        self.apply_mode(state, running=False)
 
-    def _reset_general(self, _button) -> None:
-        self._conf11.children[1].value = 4.0
-        self._conf12.children[1].value = 0.5
-        self._conf_general(_button)
+    def apply_mode(self, state: NotebookSessionState, *, running: bool) -> None:
+        widgets = self.require_widgets()
+        manual = state.is_manual_mode
+        widgets.mode.value = state.mode
+        widgets.mode.disabled = running
+        for widget in (
+            widgets.q1_slider,
+            widgets.q1_text,
+            widgets.q1_button,
+            widgets.q2_slider,
+            widgets.q2_text,
+            widgets.q2_button,
+        ):
+            widget.disabled = not manual
+        for widget in (
+            widgets.t1_slider,
+            widgets.t1_text,
+            widgets.t1_button,
+            widgets.t2_slider,
+            widgets.t2_text,
+            widgets.t2_button,
+        ):
+            widget.disabled = manual
 
-    def _conf_on_off(self, _button) -> None:
-        self._q1_dt_on_off = self._conf21.children[1].value
-        self._q2_dt_on_off = self._conf23.children[1].value
-
-    def _reset_on_off(self, _button) -> None:
-        self._conf21.children[1].value = 0.1
-        self._conf23.children[1].value = 0.1
-        self._conf_on_off(_button)
-
-    def _conf_pid(self, _button) -> None:
-        self._pid1_gain = self._conf31.children[1].value
-        self._pid1_reset = self._conf32.children[1].value
-        self._pid1_rate = self._conf33.children[1].value
-        self._pid2_gain = self._conf35.children[1].value
-        self._pid2_reset = self._conf36.children[1].value
-        self._pid2_rate = self._conf37.children[1].value
-
-    def _reset_pid(self, _button) -> None:
-        self._conf31.children[1].value = 10.0
-        self._conf32.children[1].value = 50.0
-        self._conf33.children[1].value = 1.0
-        self._conf35.children[1].value = 10.0
-        self._conf36.children[1].value = 50.0
-        self._conf37.children[1].value = 1.0
-        self._conf_pid(_button)
-
-    def _conf_mpc(self, _button) -> None:
-        self._SOLVER = self._conf40.children[1].value
-        self._CVTYPE = self._conf40.children[3].value
-        self._T1_dt = self._conf42.children[1].value
-        self._T1_tau = self._conf43.children[1].value
-        self._T2_dt = self._conf45.children[1].value
-        self._T2_tau = self._conf46.children[1].value
-        self._Q1_DMAX = self._conf48.children[1].value
-        self._Q1_DCOST = self._conf49.children[1].value
-        self._Q2_DMAX = self._conf411.children[1].value
-        self._Q2_DCOST = self._conf412.children[1].value
-
-    def _reset_mpc(self, _button) -> None:
-        self._conf40.children[1].value = "1 - APOPT"
-        self._conf40.children[3].value = "1 - Deadband"
-        self._conf42.children[1].value = 0.1
-        self._conf43.children[1].value = 10.0
-        self._conf45.children[1].value = 0.1
-        self._conf46.children[1].value = 10.0
-        self._conf48.children[1].value = 30.0
-        self._conf49.children[1].value = 1.0
-        self._conf411.children[1].value = 30.0
-        self._conf412.children[1].value = 1.0
-        self._conf_mpc(_button)
-
-    def _Q1_click(self, _button) -> None:
-        self._Q10 = self._wQ1.value
-
-    def _Q2_click(self, _button) -> None:
-        self._Q20 = self._wQ2.value
-
-    def _T1_click(self, _button) -> None:
-        self._T1_SP = self._wT1.value
-
-    def _T2_click(self, _button) -> None:
-        self._T2_SP = self._wT2.value
-
-    def _set_control_value(self, widget, value: float) -> None:
-        self._suspend_control_updates = True
-        try:
-            widget.value = value
-        finally:
-            self._suspend_control_updates = False
+    def require_widgets(self) -> NotebookWidgets:
+        if self.widgets is None:
+            raise RuntimeError("Notebook widgets have not been built")
+        return self.widgets
 
     @staticmethod
-    def _format_temperature_label(value: float) -> str:
+    def format_temperature_label(value: float) -> str:
         return f"{value:.1f}"
 
-    def _sync_q1(self, change) -> None:
-        if not self._suspend_control_updates and not self._wQ1.disabled:
-            self._Q10 = change["new"]
+    def _assign_value(self, state: NotebookSessionState, widget: Any, value: float) -> None:
+        with state.suspended_updates():
+            widget.value = value
 
-    def _sync_q2(self, change) -> None:
-        if not self._suspend_control_updates and not self._wQ2.disabled:
-            self._Q20 = change["new"]
+    def _config_label(self, text: str, *, width: str, margin: str) -> Any:
+        return self.wi.HTML(
+            value=f'<p style="text-align: right;"><b>{text}</b></p>',
+            layout=self.wi.Layout(width=width, margin=margin),
+        )
 
-    def _sync_t1_sp(self, change) -> None:
-        if not self._suspend_control_updates and not self._wT1.disabled:
-            self._T1_SP = change["new"]
+    def _config_row(self, label: str, widget: Any, *, width: str, margin: str) -> Any:
+        return self.wi.HBox((self._config_label(label, width=width, margin=margin), widget))
 
-    def _sync_t2_sp(self, change) -> None:
-        if not self._suspend_control_updates and not self._wT2.disabled:
-            self._T2_SP = change["new"]
 
-    def _stop_click(self, _button) -> None:
-        self._stop_worker()
+class NotebookRunner:
+    def __init__(
+        self,
+        *,
+        state: NotebookSessionState,
+        backend_factory: Callable[[], SimulationBackend | HardwareBackend],
+        on_snapshot: Callable[[RuntimeSnapshot], None],
+        on_running_change: Callable[[bool], None],
+        runtime_factory: Callable[[RuntimeConfig], RuntimeLike] | None = None,
+        periodic_callback_factory: Callable[[Callable[[], None], int], Any]
+        | None = None,
+    ) -> None:
+        self._state = state
+        self._backend_factory = backend_factory
+        self._on_snapshot = on_snapshot
+        self._on_running_change = on_running_change
+        self._runtime_factory = runtime_factory or self._default_runtime_factory
+        self._periodic_callback_factory = (
+            periodic_callback_factory or _create_periodic_callback
+        )
+        self._runtime: RuntimeLike | None = None
+        self._worker: threading.Thread | None = None
+        self._poller: Any = None
+        self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._stop_event = threading.Event()
 
-    def _play_click(self, _button) -> None:
-        if self._worker is not None and self._worker.is_alive():
-            return
-        self._clear_ui_queue()
-        self._initialize_runtime()
-        self._stop_event.clear()
-        self._worker_error = None
-        self._running = True
-        self._mode.disabled = True
-        workers = {
-            "Manual": self._work_man,
-            "On-Off": self._work_on_off,
-            "PID": self._work_pid,
-            "MPC": self._work_mpc,
-        }
-        self._worker = threading.Thread(target=self._run_worker, args=(workers[self._mode.value],))
-        self._worker.start()
-        self._start_ui_poller()
+    @property
+    def worker_error(self) -> BaseException | None:
+        return self._state.worker_error
 
-    def _finalize_worker(self) -> None:
-        self._stop_ui_poller()
+    @property
+    def is_running(self) -> bool:
         worker = self._worker
-        if worker is not None and worker.is_alive():
-            return
-        self._worker = None
-        self._running = False
-        self._mode.disabled = False
-        if self._runtime is not None:
-            self._runtime.shutdown()
-            self._runtime = None
+        return worker is not None and worker.is_alive()
 
-    def _stop_worker(self) -> None:
+    def start(self, mode: Mode) -> None:
+        if self.is_running:
+            return
+        self._clear_queue()
+        self._initialize_runtime()
+        self._state.worker_error = None
+        self._stop_event.clear()
+        self._worker = threading.Thread(target=self._run_worker, args=(mode,))
+        self._worker.start()
+        self._on_running_change(True)
+        self._start_poller()
+
+    def stop(self) -> None:
         if self._worker is None and self._runtime is None:
             return
         self._stop_event.set()
@@ -520,158 +944,343 @@ class _BaseNotebookGUI:
         if worker is not None:
             worker.join(timeout=2.0)
         if worker is None or not worker.is_alive():
-            self._drain_ui_queue()
-            self._finalize_worker()
+            self.poll()
         else:
-            self._start_ui_poller()
+            self._start_poller()
 
-    def _mode_switch(self, value) -> None:
-        if self._worker is not None and self._worker.is_alive():
-            return
-        self._runtime = None
+    def poll(self) -> None:
+        while True:
+            try:
+                event_type, payload = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if event_type == "snapshot":
+                self._on_snapshot(cast(RuntimeSnapshot, payload))
+            elif event_type == "error":
+                self._state.worker_error = cast(BaseException, payload)
+                self._stop_event.set()
+        if not self.is_running:
+            self._finalize()
+
+    def shutdown(self) -> None:
         self._stop_event.set()
-        self._running = False
-        self._worker_error = None
-        self._clear_ui_queue()
-        self._stop_ui_poller()
-        self._T1_SP = 30.0
-        self._T2_SP = 30.0
-        self._Q10 = 0.0
-        self._Q20 = 0.0
-        for mark in (self._T1_meas, self._T2_meas, self._T1_set_point, self._T2_set_point, self._u1, self._u2):
-            mark.x = []
-            mark.y = []
-        self._PT1.value = 20.0
-        self._PT2.value = 20.0
-        self._LT1.value = self._format_temperature_label(self._PT1.value)
-        self._LT2.value = self._format_temperature_label(self._PT2.value)
-        self._wT1.value = self._T1_SP
-        self._wT2.value = self._T2_SP
-        self._wQ1.value = self._Q10
-        self._wQ2.value = self._Q20
-        manual = value["new"] == "Manual"
-        for widget in (self._wQ1, self._tQ1, self._bQ1, self._wQ2, self._tQ2, self._bQ2):
-            widget.disabled = not manual
-        for widget in (self._wT1, self._tT1, self._bT1, self._wT2, self._tT2, self._bT2):
-            widget.disabled = manual
-
-    def _start_ui_poller(self) -> None:
-        if self._ui_poller is not None:
-            return
-        periodic_callback = importlib.import_module("tornado.ioloop").PeriodicCallback
-        self._ui_poller = periodic_callback(self._poll_ui, 50)
-        self._ui_poller.start()
-
-    def _stop_ui_poller(self) -> None:
-        if self._ui_poller is None:
-            return
-        self._ui_poller.stop()
-        self._ui_poller = None
-
-    def _poll_ui(self) -> None:
-        self._drain_ui_queue()
         worker = self._worker
-        if worker is None:
-            self._finalize_worker()
-            return
-        if worker.is_alive():
-            return
-        self._finalize_worker()
+        if worker is not None:
+            worker.join(timeout=2.0)
+        self._stop_poller()
+        self._shutdown_runtime()
+        self._worker = None
+        self._clear_queue()
+        self._on_running_change(False)
 
-    def _run_worker(self, worker) -> None:
+    def invalidate_runtime(self) -> None:
+        if self.is_running:
+            return
+        self._shutdown_runtime()
+
+    def _initialize_runtime(self) -> None:
+        if self._runtime is not None:
+            return
+        self._runtime = self._runtime_factory(self._state.runtime_config())
+        initial = self._runtime.initialize(
+            self._state.q1,
+            self._state.q2,
+            self._state.t1_sp,
+            self._state.t2_sp,
+        )
+        self._on_snapshot(initial)
+
+    def _run_worker(self, mode: Mode) -> None:
         try:
-            worker()
+            self._run_mode(mode)
         except ControllerSolveError as exc:
             self._stop_event.set()
-            self._enqueue_error(exc)
-        except Exception as exc:
+            self._queue.put(("error", exc))
+        except Exception as exc:  # pragma: no cover - defensive path
             self._stop_event.set()
-            self._enqueue_error(exc)
-        finally:
-            self._running = False
+            self._queue.put(("error", exc))
 
-    def _work_man(self) -> None:
+    def _run_mode(self, mode: Mode) -> None:
         runtime = self._runtime
         if runtime is None:
             return
+        if mode == "Manual":
+            self._loop_manual(runtime)
+            return
+        if mode == "On-Off":
+            self._loop_on_off(runtime)
+            return
+        if mode == "PID":
+            self._loop_pid(runtime)
+            return
+        self._loop_mpc(runtime)
+
+    def _loop_manual(self, runtime: RuntimeLike) -> None:
         while not self._stop_event.is_set():
-            snapshot = runtime.step_manual(self._Q10, self._Q20)
-            self._enqueue_snapshot(snapshot)
-            if self._stop_event.wait(self._sleep):
+            snapshot = runtime.step_manual(self._state.q1, self._state.q2)
+            self._queue.put(("snapshot", snapshot))
+            if self._stop_event.wait(self._state.sleep_s):
                 break
 
-    def _work_on_off(self) -> None:
-        runtime = self._runtime
-        if runtime is None:
-            return
+    def _loop_on_off(self, runtime: RuntimeLike) -> None:
         while not self._stop_event.is_set():
-            snapshot, self._Q10, self._Q20 = runtime.step_on_off(
-                self._Q10,
-                self._Q20,
-                self._T1_SP,
-                self._T2_SP,
-                self._q1_dt_on_off,
-                self._q2_dt_on_off,
+            snapshot, self._state.q1, self._state.q2 = runtime.step_on_off(
+                self._state.q1,
+                self._state.q2,
+                self._state.t1_sp,
+                self._state.t2_sp,
+                self._state.q1_dt_on_off,
+                self._state.q2_dt_on_off,
             )
-            self._enqueue_snapshot(snapshot)
-            if self._stop_event.wait(self._sleep):
+            self._queue.put(("snapshot", snapshot))
+            if self._stop_event.wait(self._state.sleep_s):
                 break
 
-    def _work_pid(self) -> None:
-        runtime = self._runtime
-        if runtime is None:
-            return
+    def _loop_pid(self, runtime: RuntimeLike) -> None:
         while not self._stop_event.is_set():
-            snapshot, self._Q10, self._Q20 = runtime.step_pid(
-                self._Q10,
-                self._Q20,
-                self._T1_SP,
-                self._T2_SP,
-                self._pid1_gain,
-                self._pid1_reset,
-                self._pid1_rate,
-                self._pid2_gain,
-                self._pid2_reset,
-                self._pid2_rate,
+            snapshot, self._state.q1, self._state.q2 = runtime.step_pid(
+                self._state.q1,
+                self._state.q2,
+                self._state.t1_sp,
+                self._state.t2_sp,
+                self._state.pid1_gain,
+                self._state.pid1_reset,
+                self._state.pid1_rate,
+                self._state.pid2_gain,
+                self._state.pid2_reset,
+                self._state.pid2_rate,
             )
-            self._enqueue_snapshot(snapshot)
-            if self._stop_event.wait(self._sleep):
+            self._queue.put(("snapshot", snapshot))
+            if self._stop_event.wait(self._state.sleep_s):
                 break
 
-    def _work_mpc(self) -> None:
-        runtime = self._runtime
-        if runtime is None:
-            return
-        config = MpcConfig(
-            solver=self._SOLVER,
-            cvtype=self._CVTYPE,
-            t1_deadband=self._T1_dt,
-            t1_tau=self._T1_tau,
-            t2_deadband=self._T2_dt,
-            t2_tau=self._T2_tau,
-            q1_dmax=self._Q1_DMAX,
-            q1_dcost=self._Q1_DCOST,
-            q2_dmax=self._Q2_DMAX,
-            q2_dcost=self._Q2_DCOST,
-        )
+    def _loop_mpc(self, runtime: RuntimeLike) -> None:
+        config = self._state.mpc_config()
         while not self._stop_event.is_set():
-            snapshot, self._Q10, self._Q20 = runtime.step_mpc(
-                self._Q10,
-                self._Q20,
-                self._T1_SP,
-                self._T2_SP,
+            snapshot, self._state.q1, self._state.q2 = runtime.step_mpc(
+                self._state.q1,
+                self._state.q2,
+                self._state.t1_sp,
+                self._state.t2_sp,
                 config,
             )
-            self._enqueue_snapshot(snapshot)
-            if self._stop_event.wait(self._sleep):
+            self._queue.put(("snapshot", snapshot))
+            if self._stop_event.wait(self._state.sleep_s):
                 break
 
+    def _start_poller(self) -> None:
+        if self._poller is not None:
+            return
+        self._poller = self._periodic_callback_factory(self.poll, 50)
+        self._poller.start()
 
-class SimulationNotebookApp(_BaseNotebookGUI):
+    def _stop_poller(self) -> None:
+        if self._poller is None:
+            return
+        self._poller.stop()
+        self._poller = None
+
+    def _finalize(self) -> None:
+        self._stop_poller()
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            return
+        self._worker = None
+        self._shutdown_runtime()
+        self._on_running_change(False)
+
+    def _shutdown_runtime(self) -> None:
+        if self._runtime is None:
+            return
+        self._runtime.shutdown()
+        self._runtime = None
+
+    def _clear_queue(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _default_runtime_factory(self, config: RuntimeConfig) -> RuntimeLike:
+        return ControlRuntime(self._backend_factory(), config)
+
+
+class _NotebookApp:
+    def __init__(
+        self,
+        backend_factory: Callable[[], SimulationBackend | HardwareBackend],
+    ) -> None:
+        wi, bq, display = _load_widget_modules()
+        self._display = display
+        self.state = NotebookSessionState()
+        self.view = NotebookView(wi=wi, bq=bq)
+        self.widgets = self.view.build(self.state)
+        self.runner = NotebookRunner(
+            state=self.state,
+            backend_factory=backend_factory,
+            on_snapshot=self._render_snapshot,
+            on_running_change=self._set_running,
+        )
+        self._bind_events()
+        self.view.reset_for_mode(self.state)
+
+    def app(self) -> None:
+        self._display(self.widgets.app_root)
+
+    def config(self) -> None:
+        self._display(self.widgets.config_root)
+
+    def _bind_events(self) -> None:
+        self.widgets.mode.observe(self._handle_mode_change, names="value")
+        self.widgets.start_button.on_click(self._handle_start)
+        self.widgets.stop_button.on_click(self._handle_stop)
+        self.widgets.q1_button.on_click(self._handle_q1_button)
+        self.widgets.q2_button.on_click(self._handle_q2_button)
+        self.widgets.t1_button.on_click(self._handle_t1_button)
+        self.widgets.t2_button.on_click(self._handle_t2_button)
+        self.widgets.q1_slider.observe(self._sync_q1, names="value")
+        self.widgets.q2_slider.observe(self._sync_q2, names="value")
+        self.widgets.t1_slider.observe(self._sync_t1, names="value")
+        self.widgets.t2_slider.observe(self._sync_t2, names="value")
+        self.widgets.general_delta.observe(self._sync_general_delta, names="value")
+        self.widgets.general_sleep.observe(self._sync_general_sleep, names="value")
+        self.widgets.onoff_q1_deadband.observe(
+            lambda change: setattr(self.state, "q1_dt_on_off", change["new"]),
+            names="value",
+        )
+        self.widgets.onoff_q2_deadband.observe(
+            lambda change: setattr(self.state, "q2_dt_on_off", change["new"]),
+            names="value",
+        )
+        self.widgets.pid1_gain.observe(
+            lambda change: setattr(self.state, "pid1_gain", change["new"]),
+            names="value",
+        )
+        self.widgets.pid1_reset.observe(
+            lambda change: setattr(self.state, "pid1_reset", change["new"]),
+            names="value",
+        )
+        self.widgets.pid1_rate.observe(
+            lambda change: setattr(self.state, "pid1_rate", change["new"]),
+            names="value",
+        )
+        self.widgets.pid2_gain.observe(
+            lambda change: setattr(self.state, "pid2_gain", change["new"]),
+            names="value",
+        )
+        self.widgets.pid2_reset.observe(
+            lambda change: setattr(self.state, "pid2_reset", change["new"]),
+            names="value",
+        )
+        self.widgets.pid2_rate.observe(
+            lambda change: setattr(self.state, "pid2_rate", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_solver.observe(
+            lambda change: setattr(self.state, "solver", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_cvtype.observe(
+            lambda change: setattr(self.state, "cvtype", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_t1_dt.observe(
+            lambda change: setattr(self.state, "t1_dt", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_t1_tau.observe(
+            lambda change: setattr(self.state, "t1_tau", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_t2_dt.observe(
+            lambda change: setattr(self.state, "t2_dt", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_t2_tau.observe(
+            lambda change: setattr(self.state, "t2_tau", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_q1_dmax.observe(
+            lambda change: setattr(self.state, "q1_dmax", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_q1_dcost.observe(
+            lambda change: setattr(self.state, "q1_dcost", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_q2_dmax.observe(
+            lambda change: setattr(self.state, "q2_dmax", change["new"]),
+            names="value",
+        )
+        self.widgets.mpc_q2_dcost.observe(
+            lambda change: setattr(self.state, "q2_dcost", change["new"]),
+            names="value",
+        )
+
+    def _render_snapshot(self, snapshot: RuntimeSnapshot) -> None:
+        self.view.render(snapshot, self.state)
+
+    def _set_running(self, running: bool) -> None:
+        self.view.apply_mode(self.state, running=running)
+
+    def _handle_mode_change(self, change: dict[str, object]) -> None:
+        if self.runner.is_running:
+            return
+        new_mode = change["new"]
+        if not isinstance(new_mode, str):
+            return
+        self.state.reset_for_mode(_coerce_mode(new_mode))
+        self.runner.invalidate_runtime()
+        self.view.reset_for_mode(self.state)
+
+    def _handle_start(self, _button: Any) -> None:
+        self.runner.start(self.state.mode)
+
+    def _handle_stop(self, _button: Any) -> None:
+        self.runner.stop()
+
+    def _handle_q1_button(self, _button: Any) -> None:
+        self.state.q1 = self.widgets.q1_slider.value
+
+    def _handle_q2_button(self, _button: Any) -> None:
+        self.state.q2 = self.widgets.q2_slider.value
+
+    def _handle_t1_button(self, _button: Any) -> None:
+        self.state.t1_sp = self.widgets.t1_slider.value
+
+    def _handle_t2_button(self, _button: Any) -> None:
+        self.state.t2_sp = self.widgets.t2_slider.value
+
+    def _sync_q1(self, change: dict[str, object]) -> None:
+        if not self.state.suspend_control_updates and not self.widgets.q1_slider.disabled:
+            self.state.q1 = _coerce_float(change["new"])
+
+    def _sync_q2(self, change: dict[str, object]) -> None:
+        if not self.state.suspend_control_updates and not self.widgets.q2_slider.disabled:
+            self.state.q2 = _coerce_float(change["new"])
+
+    def _sync_t1(self, change: dict[str, object]) -> None:
+        if not self.state.suspend_control_updates and not self.widgets.t1_slider.disabled:
+            self.state.t1_sp = _coerce_float(change["new"])
+
+    def _sync_t2(self, change: dict[str, object]) -> None:
+        if not self.state.suspend_control_updates and not self.widgets.t2_slider.disabled:
+            self.state.t2_sp = _coerce_float(change["new"])
+
+    def _sync_general_delta(self, change: dict[str, object]) -> None:
+        self.state.delta_t = _coerce_float(change["new"])
+        self.runner.invalidate_runtime()
+
+    def _sync_general_sleep(self, change: dict[str, object]) -> None:
+        self.state.sleep_s = _coerce_float(change["new"])
+
+
+class SimulationNotebookApp(_NotebookApp):
     def __init__(self) -> None:
         super().__init__(backend_factory=lambda: SimulationBackend())
 
 
-class HardwareNotebookApp(_BaseNotebookGUI):
+class HardwareNotebookApp(_NotebookApp):
     def __init__(self) -> None:
         super().__init__(backend_factory=lambda: HardwareBackend())
