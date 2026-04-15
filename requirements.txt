@@ -1,7 +1,0 @@
-bqplot==0.11.9
-gekko==1.0.4
-ipywidgets==7.5.1
-numpy==1.22.0
-scipy==1.8.1
-tclab==0.4.9
-jupyter==1.0.0

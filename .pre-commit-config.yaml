@@ -1,0 +1,18 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.8
+    hooks:
+      - id: ruff-check
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty
+        entry: ty check src/tclab_jupyter/runtime.py tests
+        language: system
+        pass_filenames: false
+      - id: pytest
+        name: pytest
+        entry: pytest
+        language: system
+        pass_filenames: false
