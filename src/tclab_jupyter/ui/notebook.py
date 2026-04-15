@@ -381,7 +381,9 @@ class NotebookView:
             layout=self.wi.Layout(width="60px"),
         )
         self.wi.jslink((q1_slider, "value"), (q1_text, "value"))
-        q1_button = self.wi.Button(description="Set", layout=self.wi.Layout(width="50px"))
+        q1_button = self.wi.Button(
+            description="Set", layout=self.wi.Layout(width="50px")
+        )
 
         q2_slider = self.wi.FloatSlider(
             value=state.q2,
@@ -403,7 +405,9 @@ class NotebookView:
             layout=self.wi.Layout(width="60px"),
         )
         self.wi.jslink((q2_slider, "value"), (q2_text, "value"))
-        q2_button = self.wi.Button(description="Set", layout=self.wi.Layout(width="50px"))
+        q2_button = self.wi.Button(
+            description="Set", layout=self.wi.Layout(width="50px")
+        )
 
         t1_slider = self.wi.FloatSlider(
             value=state.t1_sp,
@@ -515,7 +519,11 @@ class NotebookView:
         co2 = self.wi.VBox((t2_set, v_space, t2_view, v_space, q2_set))
         controls = self.wi.VBox((v_space, v_space, co1, v_space, v_space, v_space, co2))
         figures = self.wi.VBox(
-            (self.wi.HBox((fig1, fig2)), v_space, self.wi.HBox((fig3, h_space, h_space, controls))),
+            (
+                self.wi.HBox((fig1, fig2)),
+                v_space,
+                self.wi.HBox((fig3, h_space, h_space, controls)),
+            ),
             layout=self.wi.Layout(border="solid 2px gray", width="800px"),
         )
         app_root = self.wi.VBox((buttons, v_space, figures))
@@ -708,7 +716,9 @@ class NotebookView:
                             margin="0 20px 0 0",
                         ),
                     ),
-                    layout=self.wi.Layout(align_items="flex-start", padding="20px 30px"),
+                    layout=self.wi.Layout(
+                        align_items="flex-start", padding="20px 30px"
+                    ),
                 ),
                 self.wi.VBox(
                     (
@@ -728,7 +738,9 @@ class NotebookView:
                             margin="0 20px 0 0",
                         ),
                     ),
-                    layout=self.wi.Layout(align_items="flex-start", padding="20px 30px"),
+                    layout=self.wi.Layout(
+                        align_items="flex-start", padding="20px 30px"
+                    ),
                 ),
                 self.wi.VBox(
                     (
@@ -772,7 +784,9 @@ class NotebookView:
                             margin="0 20px 0 0",
                         ),
                     ),
-                    layout=self.wi.Layout(align_items="flex-start", padding="20px 30px"),
+                    layout=self.wi.Layout(
+                        align_items="flex-start", padding="20px 30px"
+                    ),
                 ),
                 self.wi.VBox(
                     (
@@ -854,7 +868,9 @@ class NotebookView:
                             margin="0 20px 0 0",
                         ),
                     ),
-                    layout=self.wi.Layout(align_items="flex-start", padding="20px 30px"),
+                    layout=self.wi.Layout(
+                        align_items="flex-start", padding="20px 30px"
+                    ),
                 ),
             ],
             layout=self.wi.Layout(width="800px", height="380px"),
@@ -941,9 +957,13 @@ class NotebookView:
         widgets.lt1.value = self.format_temperature_label(widgets.pt1.value)
         widgets.lt2.value = self.format_temperature_label(widgets.pt2.value)
         if widgets.q1_slider.disabled:
-            self._assign_value(state, widgets.q1_slider, round(float(snapshot.q1[-1]), 1))
+            self._assign_value(
+                state, widgets.q1_slider, round(float(snapshot.q1[-1]), 1)
+            )
         if widgets.q2_slider.disabled:
-            self._assign_value(state, widgets.q2_slider, round(float(snapshot.q2[-1]), 1))
+            self._assign_value(
+                state, widgets.q2_slider, round(float(snapshot.q2[-1]), 1)
+            )
 
     def reset_for_mode(self, state: NotebookSessionState) -> None:
         widgets = self.require_widgets()
@@ -1003,7 +1023,9 @@ class NotebookView:
     def format_temperature_label(value: float) -> str:
         return f"{value:.1f}"
 
-    def _assign_value(self, state: NotebookSessionState, widget: Any, value: float) -> None:
+    def _assign_value(
+        self, state: NotebookSessionState, widget: Any, value: float
+    ) -> None:
         with state.suspended_updates():
             widget.value = value
 
@@ -1422,19 +1444,31 @@ class _NotebookApp:
         self.state.t2_sp = self.widgets.t2_slider.value
 
     def _sync_q1(self, change: dict[str, object]) -> None:
-        if not self.state.suspend_control_updates and not self.widgets.q1_slider.disabled:
+        if (
+            not self.state.suspend_control_updates
+            and not self.widgets.q1_slider.disabled
+        ):
             self.state.q1 = _coerce_float(change["new"])
 
     def _sync_q2(self, change: dict[str, object]) -> None:
-        if not self.state.suspend_control_updates and not self.widgets.q2_slider.disabled:
+        if (
+            not self.state.suspend_control_updates
+            and not self.widgets.q2_slider.disabled
+        ):
             self.state.q2 = _coerce_float(change["new"])
 
     def _sync_t1(self, change: dict[str, object]) -> None:
-        if not self.state.suspend_control_updates and not self.widgets.t1_slider.disabled:
+        if (
+            not self.state.suspend_control_updates
+            and not self.widgets.t1_slider.disabled
+        ):
             self.state.t1_sp = _coerce_float(change["new"])
 
     def _sync_t2(self, change: dict[str, object]) -> None:
-        if not self.state.suspend_control_updates and not self.widgets.t2_slider.disabled:
+        if (
+            not self.state.suspend_control_updates
+            and not self.widgets.t2_slider.disabled
+        ):
             self.state.t2_sp = _coerce_float(change["new"])
 
     def _sync_general_delta(self, change: dict[str, object]) -> None:

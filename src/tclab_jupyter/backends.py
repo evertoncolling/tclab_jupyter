@@ -88,9 +88,7 @@ class SimulationBackend:
         )
         return [dth1dt, dth2dt]
 
-    def _sensor(
-        self, x: np.ndarray, t: float, th1: float, th2: float
-    ) -> list[float]:
+    def _sensor(self, x: np.ndarray, t: float, th1: float, th2: float) -> list[float]:
         tc1, tc2 = x
         tau = self.parameters.sensor_tau
         return [(-tc1 + th1) / tau, (-tc2 + th2) / tau]
